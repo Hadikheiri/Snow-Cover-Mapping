@@ -688,38 +688,48 @@ def visual_compare_rasters_strict(
 
 # === 2. Calculate Pixel-by-Pixel Agreement Percentage ===
 
+import numpy as np
+import rasterio
+
 def calculate_agreement(raster_path1, raster_path2):
     """
-    Calculates the % of matching pixels between two rasters.
+    Calculates the % of matching pixels between two rasters,
+    **excluding** any pixel equal to each file's nodata value.
 
     Returns:
-    - Dictionary with agreement percentage and pixel counts.
+      • agreement_pct
+      • total_pixels  (non-nodata in both)
+      • agree_pixels  (where data1==data2 and both valid)
     """
-    import rasterio
-    import numpy as np
-
     with rasterio.open(raster_path1) as src1, rasterio.open(raster_path2) as src2:
-        data1 = src1.read(1)
-        data2 = src2.read(1)
+        # Read as float and mask nodata
+        d1 = src1.read(1).astype('float32')
+        d2 = src2.read(1).astype('float32')
+        nod1 = src1.nodata
+        nod2 = src2.nodata
 
-        if data1.shape != data2.shape:
+        # Turn each file’s nodata value into NaN
+        if nod1 is not None:
+            d1[d1 == nod1] = np.nan
+        if nod2 is not None:
+            d2[d2 == nod2] = np.nan
+
+        if d1.shape != d2.shape:
             print("⚠️ Shape mismatch for agreement check.")
             return None
 
-        valid_mask = ~np.isnan(data1) & ~np.isnan(data2)
-        total = np.count_nonzero(valid_mask)
-        agreement = np.count_nonzero((data1 == data2) & valid_mask)
+        # Only pixels that aren’t NaN in either
+        valid = ~np.isnan(d1) & ~np.isnan(d2)
+        total = int(np.count_nonzero(valid))
+        agree = int(np.count_nonzero((d1 == d2) & valid))
 
         if total == 0:
-            return {"agreement_pct": 0, "total_pixels": 0, "agree_pixels": 0}
+            return {"agreement_pct": 0.0, "total_pixels": 0, "agree_pixels": 0}
 
-        agreement_pct = 100 * agreement / total
-
-        return {
-            "agreement_pct": agreement_pct,
-            "total_pixels": total,
-            "agree_pixels": agreement
-        }
+        pct = 100.0 * agree / total
+        return {"agreement_pct": pct,
+                "total_pixels": total,
+                "agree_pixels": agree}
 
 
 
@@ -729,3 +739,156 @@ def calculate_agreement(raster_path1, raster_path2):
 
 
 
+# ── in snow_processing.py (or a new file e.g. stats.py) ────────────────────
+import os
+import glob
+import numpy as np
+import pandas as pd
+import rasterio
+
+def compute_weekly_statistics(clipped_root: str,
+                              products: list[str],
+                              pixel_size: float = 20.0) -> pd.DataFrame:
+    """
+    Walks through clipped weekly TIFFs for each product, computes:
+      • total_pixels   (arr != nodata)
+      • snow_pixels    (arr == 1)
+      • missing_pixels (arr == nodata)
+      • snow_area_km2  (snow_pixels * pixel_size^2 / 1e6)
+      • coverage_pct   (100 * snow_pixels / total_pixels)
+
+    Parameters
+    ----------
+    clipped_root : str
+        Root folder containing one subfolder per product, each with weekly .tif files.
+    products : list[str]
+        List of product names matching subfolder names under clipped_root.
+    pixel_size : float
+        Side length of a pixel in meters (default 20.0 → 400 m²).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: product, week, total_pixels, snow_pixels, missing_pixels,
+                 snow_area_km2, coverage_pct
+    """
+    records = []
+    pixel_area = pixel_size * pixel_size
+
+    for prod in products:
+        folder = os.path.join(clipped_root, prod)
+        for path in glob.glob(os.path.join(folder, "*.tif")):
+            week = os.path.splitext(os.path.basename(path))[0]
+            with rasterio.open(path) as src:
+                arr = src.read(1)
+                nod = src.nodata
+
+            valid_mask   = (arr != nod)
+            snow_mask    = (arr == 1)
+            missing_mask = (arr == nod)
+
+            total_pixels   = int(np.count_nonzero(valid_mask))
+            snow_pixels    = int(np.count_nonzero(snow_mask))
+            missing_pixels = int(np.count_nonzero(missing_mask))
+
+            snow_area_km2 = snow_pixels * pixel_area / 1e6
+            coverage_pct  = (100.0 * snow_pixels / total_pixels
+                             if total_pixels else np.nan)
+
+            records.append({
+                "product"        : prod,
+                "week"           : week,
+                "total_pixels"   : total_pixels,
+                "snow_pixels"    : snow_pixels,
+                "missing_pixels" : missing_pixels,
+                "snow_area_km2"  : snow_area_km2,
+                "coverage_pct"   : coverage_pct
+            })
+
+    df = pd.DataFrame.from_records(records)
+    return df.sort_values(["week", "product"]).reset_index(drop=True)
+
+
+
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+
+
+
+from typing import List
+import os
+import itertools
+import glob
+import numpy as np
+import pandas as pd
+import rasterio
+from snow_processing import calculate_agreement
+
+def compute_pairwise_agreement(
+    aligned_root: str,
+    products: List[str],
+    common_weeks: List[str],
+    pixel_size: float = 20.0
+) -> pd.DataFrame:
+    """
+    For each week in common_weeks and each pair of products, computes:
+      • agreement_pct, total_pixels, agree_pixels
+      • p1_only_pixels, p2_only_pixels
+      • p1_only_area_km2, p2_only_area_km2
+      • area_bias_km2 = (p2_only - p1_only) * pixel_area_km2
+
+    aligned_root : root folder containing subfolders named after each product,
+                   where each subfolder holds weekly .tif files named 'YYYY_Wxx.tif'
+    products     : list of product names (must match subfolder names)
+    common_weeks : list of week strings, e.g. ['2022_W07', '2022_W09', …]
+    pixel_size   : side length of a pixel (meters), default 20 → pixel_area 400 m²
+    """
+    records = []
+    pixel_area_km2 = (pixel_size * pixel_size) / 1e6
+
+    for week in common_weeks:
+        for p1, p2 in itertools.combinations(products, 2):
+            f1 = os.path.join(aligned_root, p1, week + ".tif")
+            f2 = os.path.join(aligned_root, p2, week + ".tif")
+            if not (os.path.exists(f1) and os.path.exists(f2)):
+                continue
+
+            stats = calculate_agreement(f1, f2)
+            if stats is None:
+                # either a shape mismatch or zero‐pixel overlap
+                continue
+
+            # reopen the rasters to count exclusive snow pixels
+            with rasterio.open(f1) as src1, rasterio.open(f2) as src2:
+                a1 = src1.read(1)
+                a2 = src2.read(1)
+
+            # boolean masks for snow
+            p1_snow = (a1 == 1)
+            p2_snow = (a2 == 1)
+
+            only1 = int(np.count_nonzero(p1_snow & ~p2_snow))
+            only2 = int(np.count_nonzero(p2_snow & ~p1_snow))
+
+            records.append({
+                "week"             : week,
+                "prod1"            : p1,
+                "prod2"            : p2,
+                "agreement_pct"    : stats["agreement_pct"],
+                "total_pixels"     : stats["total_pixels"],
+                "agree_pixels"     : stats["agree_pixels"],
+                "p1_only_pixels"   : only1,
+                "p2_only_pixels"   : only2,
+                "p1_only_area_km2" : only1 * pixel_area_km2,
+                "p2_only_area_km2" : only2 * pixel_area_km2,
+                "area_bias_km2"    : (only2 - only1) * pixel_area_km2
+            })
+
+    df = pd.DataFrame.from_records(records)
+
+    if df.empty:
+        print("⚠️  No overlapping pairs found—check your paths, week list, or that files exist.")
+        return df
+
+    return df.sort_values(["week", "prod1", "prod2"]).reset_index(drop=True)
