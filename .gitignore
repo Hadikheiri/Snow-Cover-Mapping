@@ -1,3 +1,13 @@
+# Python .gitignore 
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.vscode/
+venv/
+env/
+.venv/
+ENV/
+.DS_Store
+Thumbs.db
+*.~ipynb_checkpoints
