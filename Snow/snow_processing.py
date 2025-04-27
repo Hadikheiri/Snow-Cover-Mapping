@@ -325,11 +325,10 @@ def aggregate_weekly(
 
 
 
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
 
-
-#_______________________________________________________________________________________________________________________________________
-#_______________________________________________________________________________________________________________________________________
-#_______________________________________________________________________________________________________________________________________
 
 
 import os
@@ -686,6 +685,67 @@ def visual_compare_rasters_strict(
 
 
 
+import os
+import rasterio
+from rasterio.mask import mask
+from typing import List, Dict
+
+def clip_weekly_to_roi(
+    weekly_dirs: Dict[str, str],
+    shapes: List[dict],
+    common_weeks: List[str],
+    clipped_root: str
+) -> None:
+    """
+    For each product in `weekly_dirs`, clips the weekly TIFFs (common_weeks)
+    to the vector ROI (`shapes`), writing outputs under `clipped_root/<product>/<week>.tif`.
+    """
+    os.makedirs(clipped_root, exist_ok=True)
+
+    for prod, src_folder in weekly_dirs.items():
+        dst_folder = os.path.join(clipped_root, prod)
+        os.makedirs(dst_folder, exist_ok=True)
+
+        for wk in common_weeks:
+            src_path = os.path.join(src_folder, f"{wk}.tif")
+            dst_path = os.path.join(dst_folder,   f"{wk}.tif")
+
+            if not os.path.exists(src_path):
+                # no such week for this product
+                continue
+            if os.path.exists(dst_path):
+                # already clipped
+                continue
+
+            with rasterio.open(src_path) as src:
+                out_img, out_transform = mask(
+                    dataset = src,
+                    shapes  = shapes,
+                    crop    = True,           # tight crop to ROI envelope
+                    nodata  = src.nodata      # fill outside ROI with your nodata
+                )
+                out_meta = src.meta.copy()
+                out_meta.update({
+                    "driver"   : "GTiff",
+                    "height"   : out_img.shape[1],
+                    "width"    : out_img.shape[2],
+                    "transform": out_transform,
+                    "nodata"   : src.nodata
+                })
+
+            with rasterio.open(dst_path, "w", **out_meta) as dst:
+                dst.write(out_img)
+
+            print(f"🏷  Clipped {prod} {wk} → {dst_path}")
+
+
+
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+
+
+
 # === 2. Calculate Pixel-by-Pixel Agreement Percentage ===
 
 import numpy as np
@@ -694,7 +754,7 @@ import rasterio
 def calculate_agreement(raster_path1, raster_path2):
     """
     Calculates the % of matching pixels between two rasters,
-    **excluding** any pixel equal to each file's nodata value.
+    **excluding** any pixels equal to each file's nodata value.
 
     Returns:
       • agreement_pct
@@ -702,13 +762,13 @@ def calculate_agreement(raster_path1, raster_path2):
       • agree_pixels  (where data1==data2 and both valid)
     """
     with rasterio.open(raster_path1) as src1, rasterio.open(raster_path2) as src2:
-        # Read as float and mask nodata
-        d1 = src1.read(1).astype('float32')
-        d2 = src2.read(1).astype('float32')
+        # read into float32 so we can use NaN
+        d1 = src1.read(1).astype("float32")
+        d2 = src2.read(1).astype("float32")
         nod1 = src1.nodata
         nod2 = src2.nodata
 
-        # Turn each file’s nodata value into NaN
+        # turn each nodata value into NaN
         if nod1 is not None:
             d1[d1 == nod1] = np.nan
         if nod2 is not None:
@@ -718,18 +778,17 @@ def calculate_agreement(raster_path1, raster_path2):
             print("⚠️ Shape mismatch for agreement check.")
             return None
 
-        # Only pixels that aren’t NaN in either
-        valid = ~np.isnan(d1) & ~np.isnan(d2)
+        # only pixels where neither is NaN
+        valid = (~np.isnan(d1)) & (~np.isnan(d2))
         total = int(np.count_nonzero(valid))
         agree = int(np.count_nonzero((d1 == d2) & valid))
 
-        if total == 0:
-            return {"agreement_pct": 0.0, "total_pixels": 0, "agree_pixels": 0}
-
-        pct = 100.0 * agree / total
-        return {"agreement_pct": pct,
-                "total_pixels": total,
-                "agree_pixels": agree}
+        pct = 100.0 * agree / total if total else 0.0
+        return {
+            "agreement_pct": pct,
+            "total_pixels": total,
+            "agree_pixels": agree
+        }
 
 
 
