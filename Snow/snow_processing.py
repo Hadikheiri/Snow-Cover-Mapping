@@ -166,17 +166,6 @@ def reproject_resample_visualize(
 #_______________________________________________________________________________________________________________________________________
 #_______________________________________________________________________________________________________________________________________
 #_______________________________________________________________________________________________________________________________________
-import os
-import numpy as np
-import rasterio
-import pandas as pd
-from datetime import datetime, timedelta
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# --------------------------------------------------------------------------
-#  aggregate_weekly  •  v2.2
-# --------------------------------------------------------------------------
 
 
 import os
@@ -193,7 +182,7 @@ def aggregate_weekly(
     output_dir: str | None = None,
     *,
     method: str = 'max',             # 'max' | 'mean' | 'median'
-    threshold: float | None = None,  # e.g. 20 for 20% threshold (None → no threshold)
+    threshold: float | None = None,  # e.g. 0.5 for binary; None → keep raw
     qc_suffix: str = '_QC.tif',      # companion QC files
     skip_existing: bool = True,
     summary: bool = True,
@@ -203,79 +192,89 @@ def aggregate_weekly(
     """
     Aggregate snow rasters into ISO-week composites.
 
-    Supports Sentinel-2 (with *_datemap), MODIS, GFSC, Sentinel-3.
-    Applies optional QC mask and percentage threshold.
+    - Groups files by ISO-week (from filenames or S2 datemap).
+    - Masks any original-nodata and (for threshold<=1) any >1 values to NaN.
+    - Applies optional QC mask (only qc==0 kept).
+    - Aggregates via max|mean|median.
+    - Applies `threshold` to produce a final binary 0/1 mask.
+    - Marks truly-NaN pixels (no valid obs) as GeoTIFF nodata (default 255).
     """
-    # 0. collect all candidate files
-    tif_list = [f for f in os.listdir(directory)
-                if f.endswith(pattern) and '_datemap' not in f]
-    tif_list.sort()
+    # 0. collect candidate files
+    all_files = [f for f in os.listdir(directory)
+                 if f.endswith(pattern) and '_datemap' not in f]
+    all_files.sort()
+    # 1. group by ISO-week
     weekly_groups: dict[str, list[str]] = defaultdict(list)
-
-    # 1. assign each file to an ISO week key
-    for fname in tif_list:
+    for fname in all_files:
         base = fname[:-len(pattern)]
         fpath = os.path.join(directory, fname)
-
-        # Sentinel-2 special case (requires *_datemap.tif)
-        dm_path = os.path.join(directory, base + '_datemap.tif')
-        if os.path.exists(dm_path):
+        # S2 datemap special case
+        dm = os.path.join(directory, base + '_datemap.tif')
+        if os.path.exists(dm):
             try:
                 date0 = datetime.strptime(''.join(c for c in base if c.isdigit())[:8], '%Y%m%d')
-                with rasterio.open(dm_path) as dm:
-                    datemap = dm.read(1)
-                # map each valid day to its ISO week
-                for day in range(1, int(datemap.max()) + 1):
+                with rasterio.open(dm) as dsrc:
+                    datemap = dsrc.read(1)
+                for day in range(1, int(np.nanmax(datemap)) + 1):
                     if np.any(datemap == day):
                         d = date0 + timedelta(days=day - 1)
-                        wk = f"{d.year}_W{d.isocalendar().week:02d}"
+                        key = d.isocalendar()
+                        wk = f"{key.year}_W{key.week:02d}"
                         weekly_groups[wk].append(fpath)
-            except Exception as e:
-                print(f"⚠️ datemap error for {fname}: {e}")
-            continue
-
-        # other products: parse date from filename
+                continue
+            except:
+                pass
+        # default: parse date portion from filename
         try:
             date0 = datetime.strptime(''.join(c for c in fname if c.isdigit())[:8], '%Y%m%d')
-            wk = f"{date0.year}_W{date0.isocalendar().week:02d}"
+            iso = date0.isocalendar()
+            wk = f"{iso.year}_W{iso.week:02d}"
             weekly_groups[wk].append(fpath)
-        except Exception as e:
-            print(f"⚠️ filename date error for {fname}: {e}")
+        except:
+            print(f"⚠️ Could not parse date from {fname}")
 
-    # prepare output directory
+    # ensure output dir exists
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    # 2. helper to build one weekly composite
-    processed = 0
-    skipped = 0
+    processed = skipped = 0
 
-    def _build_week(wk_key: str, paths: list[str]) -> str | None:
+    def _build_week(week_key: str, paths: list[str]) -> str | None:
         nonlocal processed, skipped
-        out_path = os.path.join(output_dir, f"{wk_key}.tif")
-        if skip_existing and os.path.exists(out_path):
+        out_fp = os.path.join(output_dir, f"{week_key}.tif")
+        if skip_existing and os.path.exists(out_fp):
             skipped += 1
             return None
 
-        print(f"📦 Aggregating {len(paths)} → {wk_key} ({method})")
+        print(f"📦 Aggregating {len(paths)} → {week_key} ({method})")
         stack = []
         profile = None
+
         for p in paths:
             with rasterio.open(p) as src:
                 band = src.read(1).astype('float32')
                 nod = src.nodata
+                # mask original nodata
                 if nod is not None:
                     band = np.where(band == nod, np.nan, band)
+                # mask any >1 for binary products (threshold ≤1)
+                if threshold is not None and threshold <= 1:
+                    band = np.where(band > 1, np.nan, band)
                 # apply QC mask if present
                 qc_p = p.replace(pattern, qc_suffix)
                 if os.path.exists(qc_p):
-                    with rasterio.open(qc_p) as qc_src:
-                        qc = qc_src.read(1, out_shape=band.shape, resampling=Resampling.nearest)
-                        band = np.where(qc == 0, band, np.nan)
+                    with rasterio.open(qc_p) as qcsrc:
+                        qc = qcsrc.read(1,
+                            out_shape=band.shape,
+                            resampling=Resampling.nearest
+                        )
+                    band = np.where(qc == 0, band, np.nan)
+
                 stack.append(band)
                 if profile is None:
                     profile = src.profile.copy()
-        arr = np.stack(stack, axis=0)
+
+        arr = np.stack(stack, axis=0)  # shape (n_dates, rows, cols)
 
         # 3. aggregate
         if method == 'max':
@@ -285,43 +284,51 @@ def aggregate_weekly(
         elif method == 'median':
             result = np.nanmedian(arr, axis=0)
         else:
-            raise ValueError("method must be 'max', 'mean' or 'median'")
+            raise ValueError("method must be 'max', 'mean', or 'median'")
 
-        # 4. threshold
+        # 4. threshold to binary if requested
         if threshold is not None:
             result = (result >= threshold).astype('uint8')
         else:
-            if result.max() <= 1:
+            if np.nanmax(result) <= 1:
                 result = result.astype('uint8')
 
-        # 5. write GeoTIFF with nodata=255
-        profile.update(dtype=result.dtype, count=1, nodata=255)
-        with rasterio.open(out_path, 'w', **profile) as dst:
+        # 5. preserve true nodata: any pixel always NaN across the stack
+        nodata_mask = np.all(np.isnan(arr), axis=0)
+        nodval = profile.get('nodata')
+        if nodval is None:
+            nodval = 255
+        result = np.where(nodata_mask, nodval, result).astype('uint8')
+
+        # 6. write out
+        profile.update(dtype='uint8', count=1, nodata=nodval)
+        with rasterio.open(out_fp, 'w', **profile) as dst:
             dst.write(result, 1)
 
         processed += 1
-        return out_path
+        return out_fp
 
-    # 6. run builder (parallel or serial)
-    output_paths: list[str] = []
+    # run in parallel or serial
+    outputs: list[str] = []
     if parallel:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {ex.submit(_build_week, wk, paths): wk for wk, paths in weekly_groups.items()}
+            futures = {ex.submit(_build_week, wk, paths): wk
+                       for wk, paths in weekly_groups.items()}
             for f in as_completed(futures):
-                p = f.result()
-                if p:
-                    output_paths.append(p)
+                out = f.result()
+                if out:
+                    outputs.append(out)
     else:
         for wk, paths in weekly_groups.items():
-            p = _build_week(wk, paths)
-            if p:
-                output_paths.append(p)
+            out = _build_week(wk, paths)
+            if out:
+                outputs.append(out)
 
-    # 7. summary
     if summary:
-        print(f"✔️ Processed: {processed}, ⏭ Skipped: {skipped}, Outputs: {len(output_paths)}")
+        print(f"✔️ Processed: {processed}, Skipped: {skipped}, Outputs: {len(outputs)}")
 
-    return output_paths
+    return outputs
+
 
 
 
@@ -334,108 +341,456 @@ def aggregate_weekly(
 import os
 import numpy as np
 import rasterio
-from rasterio.enums import Resampling
-from snow_processing import reproject_resample_visualize
+from rasterio.warp import calculate_default_transform, reproject, Resampling
 
-def split_and_reproject_s2_biweeks(input_dir, temp_dir, output_dir,
-                                    dst_crs='EPSG:32632', dst_res=(20, 20),
-                                    prefix='RR-', visualize=False):
+def resample_reproject_gfsc(
+    input_dir: str,
+    output_dir: str,
+    dst_crs: str = 'EPSG:32632',
+    dst_res: tuple = (20, 20),
+    threshold: float = 20.0,
+    gf_suffix: str = '_GF.tif',
+    qc_suffix: str = '_QC.tif'
+) -> list[str]:
     """
-    Splits Sentinel-2 biweekly snow masks into weekly masks using datemap.tif,
-    reprojects/resamples them, and saves results in a common grid.
+    1) Find all *_GF.tif / *_QC.tif in input_dir.
+    2) Read GF, QC; treat both GF.nodata and GF==255 as np.nan.
+    3) Reproject/resample GF (bilinear) & QC (nearest) to (dst_crs, dst_res).
+    4) Mask out (QC != 0) or np.isnan(GF) → nan.
+    5) Binarize GF ≥ threshold → 1, else 0, then set nan→255.
+    6) Write uint8 raster with nodata=255.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    out_files = []
+
+    for fname in sorted(os.listdir(input_dir)):
+        if not fname.endswith(gf_suffix):
+            continue
+
+        base = fname[:-len(gf_suffix)]
+        gf_fp = os.path.join(input_dir, base + gf_suffix)
+        qc_fp = os.path.join(input_dir, base + qc_suffix)
+        if not os.path.exists(qc_fp):
+            continue
+
+        with rasterio.open(gf_fp) as gf_src:
+            gf = gf_src.read(1).astype('float32')
+            nod = gf_src.nodata
+            profile = gf_src.profile.copy()
+            src_crs = gf_src.crs
+            src_transform = gf_src.transform
+            bounds = gf_src.bounds
+            width = gf_src.width
+            height = gf_src.height
+
+        # treat both file nodata _and_ 255 as missing
+        if nod is not None:
+            gf[gf == nod] = np.nan
+        gf[gf == 255] = np.nan
+
+        with rasterio.open(qc_fp) as qc_src:
+            qc = qc_src.read(1)
+
+        # build target grid
+        transform, w, h = calculate_default_transform(
+            src_crs, dst_crs, width, height, *bounds, resolution=dst_res
+        )
+
+        gf_dst = np.empty((h, w), dtype='float32')
+        qc_dst = np.empty((h, w), dtype=qc.dtype)
+
+        # reproject
+        reproject(
+            source=gf,
+            destination=gf_dst,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.bilinear
+        )
+        reproject(
+            source=qc,
+            destination=qc_dst,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest
+        )
+
+        # mask out clouds / missing
+        invalid = (qc_dst != 0) | np.isnan(gf_dst)
+        gf_dst[invalid] = np.nan
+
+        # threshold → binary
+        bin_dst = (gf_dst >= threshold).astype('uint8')
+        # set all masked → 255
+        bin_dst[np.isnan(gf_dst)] = 255
+
+        # write out
+        profile.update({
+            'driver': 'GTiff',
+            'crs': dst_crs,
+            'transform': transform,
+            'width': w,
+            'height': h,
+            'dtype': 'uint8',
+            'count': 1,
+            'nodata': 255
+        })
+        out_fp = os.path.join(output_dir, f"{base}.tif")
+        with rasterio.open(out_fp, 'w', **profile) as dst:
+            dst.write(bin_dst, 1)
+
+        out_files.append(out_fp)
+        print(f"✅ Daily GFSC → {out_fp}")
+
+    return out_files
+
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+
+def aggregate_weekly_gfsc(
+    input_dir: str,
+    output_dir: str,
+    *,
+    method: str = 'max',       # 'max' | 'mean' | 'median'
+    skip_existing: bool = True,
+    summary: bool = True,
+    parallel: bool = True,
+    max_workers: int = 2
+) -> list[str]:
+    """
+    Takes folder of binarized daily GFSC (0|1|255) and builds ISO-week composites:
+     • groups by date in filename → YYYY_Www
+     • stacks days, applies chosen method (nan-aware)
+     • any pixel never observed → 255
+     • writes uint8 {0,1,255}, nodata=255
+    """
+    from collections import defaultdict
+    from datetime import datetime
+    import os, numpy as np, rasterio
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # group by ISO-week
+    groups = defaultdict(list)
+    for fn in os.listdir(input_dir):
+        if not fn.endswith('.tif'): continue
+        digits = ''.join(c for c in fn if c.isdigit())
+        if len(digits) < 8: continue
+        dt = datetime.strptime(digits[:8], '%Y%m%d')
+        wk = dt.isocalendar()
+        key = f"{wk.year}_W{wk.week:02d}"
+        groups[key].append(os.path.join(input_dir, fn))
+
+    os.makedirs(output_dir, exist_ok=True)
+    processed = skipped = 0
+    outputs = []
+
+    def _build(week_key, paths):
+        nonlocal processed, skipped
+        out_fp = os.path.join(output_dir, f"{week_key}.tif")
+        if skip_existing and os.path.exists(out_fp):
+            skipped += 1
+            return None
+
+        stack = []
+        meta = None
+        for p in paths:
+            with rasterio.open(p) as src:
+                arr = src.read(1).astype('float32')
+                nod = src.nodata
+                arr[arr == nod] = np.nan
+                stack.append(arr)
+                if meta is None:
+                    meta = src.meta.copy()
+
+        arr3d = np.stack(stack, axis=0)
+        if method == 'max':
+            res = np.nanmax(arr3d, axis=0)
+        elif method == 'mean':
+            res = np.nanmean(arr3d, axis=0)
+        elif method == 'median':
+            res = np.nanmedian(arr3d, axis=0)
+        else:
+            raise ValueError("method must be 'max','mean' or 'median'")
+
+        # pixels never seen → nodata
+        nodmask = np.all(np.isnan(arr3d), axis=0)
+        res[nodmask] = meta.get('nodata', 255)
+        res = res.astype('uint8')
+
+        meta.update(dtype='uint8', count=1, nodata=255)
+        with rasterio.open(out_fp, 'w', **meta) as dst:
+            dst.write(res, 1)
+
+        processed += 1
+        return out_fp
+
+    if parallel:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fut = {ex.submit(_build, wk, paths): wk for wk, paths in groups.items()}
+            for f in as_completed(fut):
+                if out := f.result():
+                    outputs.append(out)
+    else:
+        for wk, paths in groups.items():
+            if out := _build(wk, paths):
+                outputs.append(out)
+
+    if summary:
+        print(f"✔️ Weekly: processed={processed}, skipped={skipped}, outputs={len(outputs)}")
+    return outputs
+
+
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+
+
+import os
+import numpy as np
+import rasterio
+from datetime import datetime, timedelta
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+def reproject_to_target(src_arr, src_transform, src_crs,
+                        dst_transform, dst_crs, dst_shape, nodata_val):
+    """Unchanged from your version."""
+    h, w = dst_shape
+    dst = np.full((h, w), nodata_val, dtype=src_arr.dtype)
+    reproject(
+        source=src_arr,
+        destination=dst,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=Resampling.nearest,
+        src_nodata=nodata_val,
+        dst_nodata=nodata_val
+    )
+    return dst
+
+def process_all_biweekly(input_root, output_dir):
+    dst_crs = 'EPSG:32632'
+    weekly_accum = {}
+    target_transform = None
+    target_shape = None
+
+    mask_files = []
+    for root, _, files in os.walk(input_root):
+        for f in files:
+            if f.endswith('_SnowMask_latest.tif'):
+                mask_files.append(os.path.join(root, f))
+
+    print(f"Found {len(mask_files)} biweekly SnowMask files.")
+    for idx, mask_fp in enumerate(sorted(mask_files), 1):
+        dm_fp = mask_fp.replace('_SnowMask_latest.tif','_SnowMask_latest_datemap.tif')
+        if not os.path.exists(dm_fp):
+            print(f"[{idx}/{len(mask_files)}] Missing datemap, skipping.")
+            continue
+
+        print(f"[{idx}/{len(mask_files)}] {os.path.basename(mask_fp)}")
+        with rasterio.open(mask_fp) as sm_ds, rasterio.open(dm_fp) as dm_ds:
+            # ───────────────────────────────────────────────────────────────────────
+            # 1) establish output grid once
+            if target_transform is None:
+                tform, w, h = calculate_default_transform(
+                    sm_ds.crs, dst_crs,
+                    sm_ds.width, sm_ds.height,
+                    *sm_ds.bounds,
+                    resolution=20
+                )
+                target_transform = tform
+                target_shape = (h, w)
+
+            # 2) force snow‐mask nodata to 255, keep 0 as valid
+            nod_sm = 255
+            nod_dm = dm_ds.nodatavals[0] if dm_ds.nodatavals[0] is not None else 0
+
+            # 3) reproject both rasters
+            sm_reproj = reproject_to_target(
+                sm_ds.read(1), sm_ds.transform, sm_ds.crs,
+                target_transform, dst_crs, target_shape, nod_sm
+            )
+            dm_reproj = reproject_to_target(
+                dm_ds.read(1).astype(np.int32), dm_ds.transform, dm_ds.crs,
+                target_transform, dst_crs, target_shape, nod_dm
+            )
+
+            # 4) valid = “observed” pixels per datemap only
+            valid = (dm_reproj != nod_dm)
+
+            # 5) parse the biweekly period from the filename
+            base = os.path.basename(mask_fp).split('_SnowMask')[0]
+            d0 = datetime.strptime(base.split('_')[0], "%Y%m%d").date()
+            d1 = datetime.strptime(base.split('_')[1], "%Y%m%d").date()
+
+            # 6) decide if datemap is day-index (1–14) or YYYYMMDD values
+            vals = dm_reproj[valid]
+            day_index = bool(vals.size and vals.max() <= 31)
+
+            # 7) build two boolean masks + get their ISO‐week keys
+            if day_index:
+                offs   = dm_reproj - 1       # 0–13
+                w1_map = valid & (offs <= 6)
+                w2_map = valid & (offs >= 7)
+                iso1   = d0.isocalendar()[:2]
+                iso2   = (d0 + timedelta(days=7)).isocalendar()[:2]
+            else:
+                # map each unique YYYYMMDD → ISO and build year/week arrays
+                uniq   = np.unique(vals)
+                iso_map = {d: datetime.strptime(str(d), "%Y%m%d").isocalendar()[:2]
+                        for d in uniq}
+                years  = np.zeros(target_shape, np.int32)
+                weeks  = np.zeros(target_shape, np.int32)
+                for d,(y,wk) in iso_map.items():
+                    m = (dm_reproj == d)
+                    years[m] = y
+                    weeks[m] = wk
+                # now mask out the two periods
+                iso1 = d0.isocalendar()[:2]
+                iso2 = (d0 + timedelta(days=7)).isocalendar()[:2]
+                w1_map = valid & (years == iso1[0]) & (weeks == iso1[1])
+                w2_map = valid & (years == iso2[0]) & (weeks == iso2[1])
+
+            # 8) ACCUMULATE into weekly_accum (this must come *after* you have w1_map/w2_map)
+            for wk_map, iso in ((w1_map, iso1), (w2_map, iso2)):
+                key = tuple(iso)
+                if key not in weekly_accum:
+                    weekly_accum[key] = np.full(target_shape, 255, np.uint8)
+                arr = weekly_accum[key]
+                # snow wins
+                arr[wk_map & (sm_reproj == 1)] = 1
+                # no‐snow only where still nodata
+                arr[wk_map & (sm_reproj == 0) & (arr == 255)] = 0
+
+    # 8) write outputs
+    os.makedirs(output_dir, exist_ok=True)
+    for (y, w), arr in sorted(weekly_accum.items()):
+        out_fp = os.path.join(output_dir, f"{y}_W{w:02d}.tif")
+        with rasterio.open(
+            out_fp, 'w', driver='GTiff',
+            height=arr.shape[0], width=arr.shape[1],
+            count=1, dtype='uint8',
+            crs=dst_crs, transform=target_transform,
+            nodata=255, compress='deflate', tiled=True
+        ) as dst:
+            dst.write(arr, 1)
+        print("→ Wrote", out_fp)
+
+    print("Done.")
+
+
+
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+
+import os
+import numpy as np
+import rasterio
+from datetime import datetime
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+def reproject_s3_weekly(
+    input_dir: str,
+    output_dir: str,
+    dst_crs: str = 'EPSG:32632',
+    dst_res: tuple = (20, 20)
+) -> list[str]:
+    """
+    Reprojects Sentinel-3 weekly snow masks into a common grid (EPSG:32632, 20m)
+    and names them by ISO-week (YYYY_Www.tif).  No prefix is added.
 
     Parameters:
-    - input_dir: Folder containing *.tif and *_datemap.tif files
-    - temp_dir: Temp folder for week1/week2 masks (auto-cleaned after use)
-    - output_dir: Final destination for reprojected/resampled weekly files
-    - dst_crs: Target coordinate reference system (EPSG code)
-    - dst_res: Target pixel resolution (tuple)
-    - prefix: Prefix for output filenames
-    - visualize: Whether to show downsampled preview during reprojection
+    - input_dir: folder containing files like 'YYYYMMDD_YYYYMMDD_SnowMask.tif'
+    - output_dir: where to save reprojected weekly rasters
+    - dst_crs: target CRS (default EPSG:32632)
+    - dst_res: target resolution (default 20m)
 
     Returns:
-    - output_paths: List of final output file paths created
+    - List of output file paths (unique ISO-week filenames)
     """
-
-    os.makedirs(temp_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    output_paths = []
+    out_files = []
 
-    for fname in os.listdir(input_dir):
-        if fname.endswith('.tif') and '_datemap' not in fname:
-            mask_path = os.path.join(input_dir, fname)
-            base_name = fname.replace('.tif', '')
-            datemap_path = os.path.join(input_dir, f"{base_name}_datemap.tif")
+    # Loop through each Sentinel-3 weekly source
+    for fname in sorted(os.listdir(input_dir)):
+        if not fname.lower().endswith('.tif'):
+            continue
+        # skip any QC or unwanted files
+        if 'snowmask' not in fname.lower():
+            continue
 
-            # Skip if no datemap exists
-            if not os.path.exists(datemap_path):
-                print(f"⚠️ Missing datemap for: {fname} — skipping.")
-                continue
+        src_fp = os.path.join(input_dir, fname)
+        # Extract the starting date (first 8 digits)
+        digits = ''.join(c for c in fname if c.isdigit())
+        try:
+            date0 = datetime.strptime(digits[:8], '%Y%m%d')
+        except ValueError:
+            print(f"⚠️ Cannot parse date from '{fname}', skipping.")
+            continue
+        iso = date0.isocalendar()
+        week_key = f"{iso.year}_W{iso.week:02d}"  # e.g. '2022_W07'
+        out_fp = os.path.join(output_dir, f"{week_key}.tif")
 
-            # Define final output filenames
-            week1_out = os.path.join(output_dir, f"{prefix}{base_name}_W1.tif")
-            week2_out = os.path.join(output_dir, f"{prefix}{base_name}_W2.tif")
+        # Reproject + resample to target grid
+        with rasterio.open(src_fp) as src:
+            data = src.read(1)
+            profile = src.profile.copy()
+            src_crs = src.crs
+            src_transform = src.transform
+            src_width = src.width
+            src_height = src.height
+            src_bounds = src.bounds
 
-            # Skip processing if outputs already exist
-            if os.path.exists(week1_out) and os.path.exists(week2_out):
-                print(f"⏭ Skipping {base_name} — outputs already exist.")
-                continue
+        # compute transform and new dims using bounds unpack
+        transform, w, h = calculate_default_transform(
+            src_crs, dst_crs,
+            src_width, src_height,
+            *src_bounds,
+            resolution=dst_res
+        )
+        meta = profile.copy()
+        meta.update({
+            'crs': dst_crs,
+            'transform': transform,
+            'width': w,
+            'height': h,
+            'dtype': 'uint8',
+            'count': 1,
+            'nodata': 255
+        })
 
-            # Load input mask and datemap
-            with rasterio.open(mask_path) as mask_src, rasterio.open(datemap_path) as dm_src:
-                mask = mask_src.read(1)
-                datemap = dm_src.read(1)
+        dst_arr = np.empty((h, w), dtype='uint8')
+        reproject(
+            source=data,
+            destination=dst_arr,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest
+        )
 
-                if mask.shape != datemap.shape:
-                    print(f"❌ Shape mismatch: {fname} — skipping.")
-                    continue
+        with rasterio.open(out_fp, 'w', **meta) as dst:
+            dst.write(dst_arr, 1)
+        print(f"✅ S3 week {week_key} → {out_fp}")
+        out_files.append(out_fp)
 
-                profile = mask_src.profile
-                profile.update(dtype='uint8', count=1)
-
-                # Split into week 1 and week 2
-                week1_mask = np.where((datemap >= 1) & (datemap <= 7), mask, 0)
-                week2_mask = np.where((datemap >= 8) & (datemap <= 14), mask, 0)
-
-                # Save temporary intermediate files
-                week1_temp = os.path.join(temp_dir, f"{base_name}_W1_temp.tif")
-                week2_temp = os.path.join(temp_dir, f"{base_name}_W2_temp.tif")
-
-                with rasterio.open(week1_temp, 'w', **profile) as dst1:
-                    dst1.write(week1_mask, 1)
-
-                with rasterio.open(week2_temp, 'w', **profile) as dst2:
-                    dst2.write(week2_mask, 1)
-
-            # Reproject + Resample
-            reproject_resample_visualize(
-                src_path=week1_temp,
-                dst_path=week1_out,
-                dst_crs=dst_crs,
-                dst_res=dst_res,
-                resampling_method=Resampling.nearest,
-                visualize=visualize
-            )
-
-            reproject_resample_visualize(
-                src_path=week2_temp,
-                dst_path=week2_out,
-                dst_crs=dst_crs,
-                dst_res=dst_res,
-                resampling_method=Resampling.nearest,
-                visualize=visualize
-            )
-
-            # Clean up temporary files
-            os.remove(week1_temp)
-            os.remove(week2_temp)
-
-            # Add to output list
-            output_paths.extend([week1_out, week2_out])
-            print(f"✅ Done: {base_name}")
-
-    return output_paths
-
+    # Remove duplicates: if multiple source tiles produce same week_key, keep one
+    unique = []
+    seen = set()
+    for fp in out_files:
+        week = os.path.splitext(os.path.basename(fp))[0]
+        if week not in seen:
+            seen.add(week)
+            unique.append(fp)
+    return unique
 
 
 #_______________________________________________________________________________________________________________________________________
