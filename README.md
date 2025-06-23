@@ -46,7 +46,7 @@ cd Snow-Cover-Mapping
 pip install -r requirements.txt
 ```
 
-> **Dependencies:** `rasterio`, `numpy`, `pandas`, `matplotlib`, `geopandas`, `scikit-image` 
+> **Dependencies:** `rasterio`, `numpy`, `pandas`, `matplotlib`, `geopandas`
 
 ---
 
