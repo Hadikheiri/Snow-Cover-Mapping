@@ -89,6 +89,44 @@ def check_all_products_side_by_side(product_folders,
 #_______________________________________________________________________________________________________________________________________
 
 
+import rasterio
+import numpy as np
+
+def prepare_modis_mask(src_fp, clean_fp):
+    """
+    Read the raw MODIS snow mask (values 1=no-snow, 2=snow),
+    remap to 0/1/255, and write out a GeoTIFF on the original MODIS grid.
+
+    Mapping:
+      • 1 → 0   (clear / no-snow)
+      • 2 → 1   (snow)
+      • any other value → 255 (nodata / cloud)
+    """
+    with rasterio.open(src_fp) as src:
+        data = src.read(1)
+        meta = src.meta.copy()
+
+    # Initialize everything to nodata
+    clean = np.full_like(data, 255, dtype=np.uint8)
+
+    # Remap
+    clean[data == 1] = 0   # clear → 0
+    clean[data == 2] = 1   # snow  → 1
+
+    # Write out with nodata=255
+    meta.update(dtype='uint8', nodata=255)
+    with rasterio.open(clean_fp, 'w', **meta) as dst:
+        dst.write(clean, 1)
+
+    return clean_fp
+
+
+
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+
+
 
 import os
 import numpy as np
@@ -97,68 +135,78 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 import matplotlib.pyplot as plt
 
 def reproject_resample_visualize(
-    src_path,
-    dst_path,
-    dst_crs='EPSG:32632',
-    dst_res=(20, 20),
-    resampling_method=Resampling.nearest,    # Use Resampling.nearest for binary products (MODIS, S2, S3)   /   Use Resampling.bilinear for continuous products (GFSC, EURAC)
-    visualize=True,
-    downsample_factor=10
+    src_path: str,
+    dst_path: str,
+    dst_crs: str = 'EPSG:32632',
+    dst_res: tuple = (60, 60),
+    resampling_method=Resampling.nearest,
+    visualize: bool = True,
+    downsample_factor: int = 10
 ):
     """
-    Reprojects and resamples a raster to a target CRS and resolution,
-    then optionally visualizes the result.
-
-    Parameters:
-    - src_path: str, path to input raster file
-    - dst_path: str, path to save output raster
-    - dst_crs: str, target CRS (default: 'EPSG:32632')
-    - dst_res: tuple, target resolution in meters (default: 20x20)
-    - resampling_method: rasterio.enums.Resampling, method to use
-    - visualize: bool, whether to plot a preview of the result
-    - downsample_factor: int, how much to reduce resolution for preview
+    Reproject & resample a single-band raster to a target CRS/resolution,
+    preserving nodata throughout, then optionally show a quick preview.
     """
-
-    # Load input raster and calculate transform for reprojection
+    # Open source and compute the target grid & metadata
     with rasterio.open(src_path) as src:
+        src_crs       = src.crs
+        src_transform = src.transform
+        nodata_val    = src.nodata if src.nodata is not None else 255
+        dtype         = src.dtypes[0]
+        band_count    = src.count
+
+        # Compute new transform + shape
         transform, width, height = calculate_default_transform(
-            src.crs, dst_crs, src.width, src.height, *src.bounds, resolution=dst_res
+            src_crs, dst_crs,
+            src.width, src.height,
+            *src.bounds,
+            resolution=dst_res
         )
 
-        kwargs = src.meta.copy()
-        kwargs.update({
-            'driver': 'GTiff',
-            'crs': dst_crs,
-            'transform': transform,
-            'width': width,
-            'height': height,
-            'dtype': src.dtypes[0],
-            'count': src.count
+        # Build output metadata (including nodata and CRS)
+        out_meta = src.meta.copy()
+        out_meta.update({
+            'driver'    : 'GTiff',
+            'crs'       : dst_crs,
+            'transform' : transform,
+            'width'     : width,
+            'height'    : height,
+            'dtype'     : dtype,
+            'count'     : band_count,
+            'nodata'    : nodata_val,
+            'compress'  : 'deflate'
         })
 
-        # Perform reprojection and save output
-        with rasterio.open(dst_path, 'w', **kwargs) as dst:
-            for i in range(1, src.count + 1):
+        # Now that src is still open, create & write into dst
+        with rasterio.open(dst_path, 'w', **out_meta) as dst:
+            for b in range(1, band_count + 1):
+                # Pre-fill output array with nodata
+                dest = np.full((height, width), nodata_val, dtype=dtype)
+
                 reproject(
-                    source=rasterio.band(src, i),
-                    destination=rasterio.band(dst, i),
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=transform,
-                    dst_crs=dst_crs,
-                    resampling=resampling_method
+                    source        = rasterio.band(src, b),
+                    destination   = dest,
+                    src_transform = src_transform,
+                    src_crs       = src_crs,
+                    src_nodata    = nodata_val,
+                    dst_transform = transform,
+                    dst_crs       = dst_crs,
+                    dst_nodata    = nodata_val,
+                    resampling    = resampling_method
                 )
 
-    print(f"✅ Resampled and reprojected saved to: {dst_path}")
+                dst.write(dest, b)
 
-    # Optional: Visualization (downsampled for speed/memory)
+    print(f"✅ Resampled & reprojected saved to: {dst_path}")
+
+    # Optional downsampled preview
     if visualize:
-        with rasterio.open(dst_path) as dst:
-            data = dst.read(1)[::downsample_factor, ::downsample_factor]
-
-        plt.imshow(data, cmap='gray')
-        plt.title(f"Preview: Resampled Snow Mask\n({os.path.basename(dst_path)})")
+        with rasterio.open(dst_path) as preview:
+            arr = preview.read(1)[::downsample_factor, ::downsample_factor]
+        plt.imshow(arr, cmap='gray')
+        plt.title(f"Preview: {os.path.basename(dst_path)}")
         plt.colorbar()
+        plt.axis('off')
         plt.show()
 
 
@@ -336,8 +384,6 @@ def aggregate_weekly(
 #_______________________________________________________________________________________________________________________________________
 #_______________________________________________________________________________________________________________________________________
 
-
-
 import os
 import numpy as np
 import rasterio
@@ -347,18 +393,20 @@ def resample_reproject_gfsc(
     input_dir: str,
     output_dir: str,
     dst_crs: str = 'EPSG:32632',
-    dst_res: tuple = (20, 20),
+    dst_res: tuple = (60, 60),
     threshold: float = 20.0,
     gf_suffix: str = '_GF.tif',
-    qc_suffix: str = '_QC.tif'
+    qc_suffix: str = '_QC.tif',
+    acceptable_qc: set[int] = {0, 1, 2, 3}
 ) -> list[str]:
     """
-    1) Find all *_GF.tif / *_QC.tif in input_dir.
-    2) Read GF, QC; treat both GF.nodata and GF==255 as np.nan.
-    3) Reproject/resample GF (bilinear) & QC (nearest) to (dst_crs, dst_res).
-    4) Mask out (QC != 0) or np.isnan(GF) → nan.
-    5) Binarize GF ≥ threshold → 1, else 0, then set nan→255.
-    6) Write uint8 raster with nodata=255.
+    1) Find all *_GF.tif and *_QC.tif pairs in input_dir.
+    2) Load GF and QC bands, masking out original nodata and fill (255) as NaN.
+    3) Reproject & resample GF (bilinear) and QC (nearest) to (dst_crs, dst_res), pre-filling
+       destination arrays to preserve nodata (GF→NaN, QC→invalid by default).
+    4) Mask out pixels where QC is not in acceptable_qc or GF is NaN.
+    5) Threshold GF >= threshold → 1, < threshold → 0, NaN → 255 (nodata).
+    6) Write a uint8 GeoTIFF with nodata=255, returning list of file paths.
     """
     os.makedirs(output_dir, exist_ok=True)
     out_files = []
@@ -373,9 +421,10 @@ def resample_reproject_gfsc(
         if not os.path.exists(qc_fp):
             continue
 
+        # 2a. Read GF
         with rasterio.open(gf_fp) as gf_src:
             gf = gf_src.read(1).astype('float32')
-            nod = gf_src.nodata
+            gf_nodata = gf_src.nodata
             profile = gf_src.profile.copy()
             src_crs = gf_src.crs
             src_transform = gf_src.transform
@@ -383,23 +432,26 @@ def resample_reproject_gfsc(
             width = gf_src.width
             height = gf_src.height
 
-        # treat both file nodata _and_ 255 as missing
-        if nod is not None:
-            gf[gf == nod] = np.nan
+        # Mask original nodata/fill
+        if gf_nodata is not None:
+            gf[gf == gf_nodata] = np.nan
         gf[gf == 255] = np.nan
 
+        # 2b. Read QC
         with rasterio.open(qc_fp) as qc_src:
-            qc = qc_src.read(1)
+            qc = qc_src.read(1).astype('uint8')
+            qc_nodata = qc_src.nodata if qc_src.nodata is not None else 255
 
-        # build target grid
+        # 3. Compute target grid
         transform, w, h = calculate_default_transform(
             src_crs, dst_crs, width, height, *bounds, resolution=dst_res
         )
 
-        gf_dst = np.empty((h, w), dtype='float32')
-        qc_dst = np.empty((h, w), dtype=qc.dtype)
+        # Pre-fill dest with NaN/QC_nodata
+        gf_dst = np.full((h, w), np.nan, dtype='float32')
+        qc_dst = np.full((h, w), qc_nodata, dtype='uint8')
 
-        # reproject
+        # Reproject
         reproject(
             source=gf,
             destination=gf_dst,
@@ -419,16 +471,17 @@ def resample_reproject_gfsc(
             resampling=Resampling.nearest
         )
 
-        # mask out clouds / missing
-        invalid = (qc_dst != 0) | np.isnan(gf_dst)
-        gf_dst[invalid] = np.nan
+        # 4. Mask via QC whitelist + GF NaNs
+        valid_qc = np.isin(qc_dst, list(acceptable_qc))
+        valid = valid_qc & (~np.isnan(gf_dst))
+        gf_dst[~valid] = np.nan
 
-        # threshold → binary
-        bin_dst = (gf_dst >= threshold).astype('uint8')
-        # set all masked → 255
-        bin_dst[np.isnan(gf_dst)] = 255
+        # 5. Threshold to binary + set nodata
+        bin_dst = np.full((h, w), 255, dtype='uint8')
+        bin_dst[gf_dst >= threshold] = 1
+        bin_dst[(gf_dst < threshold) & (~np.isnan(gf_dst))] = 0
 
-        # write out
+        # 6. Write out
         profile.update({
             'driver': 'GTiff',
             'crs': dst_crs,
@@ -444,13 +497,18 @@ def resample_reproject_gfsc(
             dst.write(bin_dst, 1)
 
         out_files.append(out_fp)
-        print(f"✅ Daily GFSC → {out_fp}")
+        kept_pct = valid.sum() / valid.size * 100
+        print(f"✅ Daily GFSC → {out_fp} (kept {kept_pct:.1f}% pixels via QC∈{sorted(acceptable_qc)})")
 
     return out_files
 
+
+
 #_______________________________________________________________________________________________________________________________________
 #_______________________________________________________________________________________________________________________________________
 #_______________________________________________________________________________________________________________________________________
+
+
 
 def aggregate_weekly_gfsc(
     input_dir: str,
@@ -549,139 +607,145 @@ def aggregate_weekly_gfsc(
 #_______________________________________________________________________________________________________________________________________
 #_______________________________________________________________________________________________________________________________________
 
-###S2
 
 import os
+import re
 import numpy as np
 import rasterio
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.transform import array_bounds
 
-def process_s2_weekly_max_nn(
+def process_s2_weekly(
     input_root: str,
     output_dir: str,
     dst_crs: str = 'EPSG:32632',
-    resolution: float = 20.0
+    resolution: float = 60.0
 ) -> list[str]:
     """
-    1) Walk input_root for *_SnowMask_latest.tif + corresponding *_datemap.tif
-       to build weekly composites on the native grid via temporal max.
-    2) Compute a single target grid (CRS + resolution).
-    3) Reproject each weekly mask to the target grid using nearest-neighbor.
-    4) Write out YYYY_Www.tif (uint8: 0=no-snow, 1=snow, 255=nodata).
+    Processes bi-weekly S2 snow products into weekly composites.
+
+    1.  Walks input_root to find *_SnowMask_latest.tif and its paired *_datemap.tif.
+    2.  Extracts the 14-day period from the filename (e.g., 20220103_20220116).
+    3.  Uses the datemap (values 1-14) to split the snow mask into two weekly arrays.
+        - Week A: Corresponds to the first 7 days of the period.
+        - Week B: Corresponds to the second 7 days of the period.
+    4.  Aggregates all data for the same ISO week into a single array, handling overlaps.
+        - Merging rule: No-snow (0) only fills nodata pixels, but snow (1) always overwrites.
+    5.  Reprojects each final weekly mask to the target CRS and resolution.
     """
     os.makedirs(output_dir, exist_ok=True)
+    # The dictionary key is a tuple: (year, iso_week_number)
+    # The value is another tuple: (numpy_array, rasterio_transform, rasterio_crs)
+    weekly = defaultdict(lambda: (None, None, None))
+    
+    # This regex now correctly captures the first date as the start date.
+    date_re = re.compile(r"(\d{8})_\d{8}")
 
-    # 1) Aggregate on native grid
-    weekly: dict[tuple[int,int], tuple[np.ndarray, rasterio.Affine, rasterio.crs.CRS]] = defaultdict(lambda: (None,None,None))
     for root, _, files in os.walk(input_root):
-        for fn in files:
+        for fn in sorted(files): # Sorting ensures chronological processing
             if not fn.endswith('_SnowMask_latest.tif'):
                 continue
+
+            m = date_re.search(fn)
+            if not m:
+                print(f"⚠️  Skipping (no valid date pattern found): {fn}")
+                continue
+            
+            # This is the START date of the 14-day period
+            start_date = datetime.strptime(m.group(1), "%Y%m%d").date()
+
             sm_fp = os.path.join(root, fn)
             dm_fp = sm_fp.replace('_SnowMask_latest.tif', '_SnowMask_latest_datemap.tif')
             if not os.path.exists(dm_fp):
-                print("⚠️ Missing datemap for", sm_fp)
+                print(f"⚠️ Missing datemap for {fn}")
                 continue
-
-            # parse start date
-            base = fn.split('_SnowMask')[0]
-            d0 = datetime.strptime(base.split('_')[0], "%Y%m%d").date()
 
             with rasterio.open(sm_fp) as sm_ds, rasterio.open(dm_fp) as dm_ds:
                 sm = sm_ds.read(1).astype('uint8')
-                dm = dm_ds.read(1).astype('int32')
-                transform, crs = sm_ds.transform, sm_ds.crs
+                dm = dm_ds.read(1).astype('uint8') # Datemap can be uint8
+                transform = sm_ds.transform
+                crs = sm_ds.crs
+                nodata = sm_ds.nodata if sm_ds.nodata is not None else 255
                 shape = sm.shape
-                nodata = sm_ds.nodata
 
-            # assign each pixel to week1 or week2
-            # if datemap values ≤31, treat as offsets 1–14
-            if dm.max() <= 31:
-                offs = dm - 1
-                mapping = [
-                    (offs <= 6, d0.isocalendar()[:2]),
-                    (offs >= 7, (d0 + timedelta(days=7)).isocalendar()[:2]),
-                ]
-            else:
-                # values are YYYYMMDD
-                uniq = np.unique(dm[dm>0])
-                iso_map = {d: datetime.strptime(str(d), "%Y%m%d").isocalendar()[:2] for d in uniq}
-                years = np.zeros(shape, int)
-                weeks = np.zeros(shape, int)
-                for d,(y,wk) in iso_map.items():
-                    mask = (dm == d)
-                    years[mask], weeks[mask] = y, wk
-                iso1 = d0.isocalendar()[:2]
-                iso2 = (d0 + timedelta(days=7)).isocalendar()[:2]
-                mapping = [
-                    ((years==iso1[0]) & (weeks==iso1[1]), iso1),
-                    ((years==iso2[0]) & (weeks==iso2[1]), iso2),
-                ]
+            # --- CORRECT ISO WEEK CALCULATION ---
+            # Week A is the ISO week of the start_date.
+            # Week B is the ISO week of the start_date plus 7 days.
+            iso_week_a = start_date.isocalendar()[:2]
+            iso_week_b = (start_date + timedelta(days=7)).isocalendar()[:2]
 
-            # temporal max composition into weekly[(year,week)]
-            for mask_arr, iso in mapping:
+            # Datemap values 1-7 belong to the first week (Week A)
+            # Datemap values 8-14 belong to the second week (Week B)
+            mappings = [
+                ((dm >= 1) & (dm <= 7),  iso_week_a),
+                ((dm >= 8) & (dm <= 14), iso_week_b),
+            ]
+
+            for mask_arr, iso in mappings:
                 if not mask_arr.any():
                     continue
+                
+                # Retrieve the aggregated array for this ISO week, or None if it's the first time
                 arr, tr, cr = weekly[iso]
+                
+                # If it's the first time we see this week, create a new blank array
                 if arr is None:
-                    # initialize full‐nodata array
-                    arr = np.full(shape, nodata or 255, dtype='uint8')
+                    arr = np.full(shape, nodata, dtype='uint8')
                     tr, cr = transform, crs
-                # 0 stamp only where snow==0 and arr is still nodata
-                arr[mask_arr & (sm==0) & (arr==(nodata or 255))] = 0
-                # 1 stamp wherever sm==1
-                arr[mask_arr & (sm==1)] = 1
+
+                # Apply the merging logic
+                # No-snow (0) only fills existing nodata values
+                arr[mask_arr & (sm == 0) & (arr == nodata)] = 0
+                # Snow (1) always overwrites any existing value (nodata, 0)
+                arr[mask_arr & (sm == 1)] = 1
+
+                # Store the updated array back in the dictionary
                 weekly[iso] = (arr, tr, cr)
 
     if not weekly:
-        print("⚠️ No S2 biweekly masks found.")
+        print("⚠️ No S2 weekly masks were generated.")
         return []
 
-    # 2) Compute target grid once (use first week)
-    (year0, week0), (arr0, tr0, cr0) = next(iter(weekly.items()))
+    # --- REPROJECTION TO COMMON GRID ---
+    # Use the first processed raster to define the geographic bounds for the common grid
+    _, (arr0, tr0, cr0) = next(iter(weekly.items()))
     h0, w0 = arr0.shape
     left, bottom, right, top = array_bounds(h0, w0, tr0)
+    
     tgt_transform, tgt_width, tgt_height = calculate_default_transform(
         cr0, dst_crs, w0, h0, left, bottom, right, top, resolution=resolution
     )
 
-    # 3) Prepare output metadata
-    nodata_val = np.iinfo(arr0.dtype).max  # 255 for uint8
+    nodata_val = 255
     meta = {
-        'driver': 'GTiff',
-        'dtype': arr0.dtype,
-        'count': 1,
-        'crs': dst_crs,
-        'transform': tgt_transform,
-        'width': tgt_width,
-        'height': tgt_height,
-        'nodata': nodata_val,
-        'compress': 'deflate',
-        'tiled': True
+        'driver': 'GTiff', 'dtype': 'uint8', 'count': 1,
+        'crs': dst_crs, 'transform': tgt_transform,
+        'width': tgt_width, 'height': tgt_height,
+        'nodata': nodata_val, 'compress': 'deflate', 'tiled': True
     }
 
     out_files = []
-    # 4) Reproject & write each weekly composite
+    # Sort items by year, then week number for chronological output
     for (year, week), (arr_nat, tr_nat, cr_nat) in sorted(weekly.items()):
-        dst_arr = np.full((tgt_height, tgt_width), nodata_val, dtype=arr_nat.dtype)
+        dst_arr = np.full((tgt_height, tgt_width), nodata_val, dtype='uint8')
         reproject(
-            source      = arr_nat,
-            destination = dst_arr,
-            src_transform = tr_nat,
-            src_crs       = cr_nat,
-            dst_transform = tgt_transform,
-            dst_crs       = dst_crs,
-            resampling    = Resampling.nearest,
-            src_nodata    = nodata_val,
-            dst_nodata    = nodata_val
+            source=arr_nat,
+            destination=dst_arr,
+            src_transform=tr_nat,
+            src_crs=cr_nat,
+            dst_transform=tgt_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest,
+            src_nodata=nodata_val,
+            dst_nodata=nodata_val
         )
-
-        # clamp stray values
-        bad = ~np.isin(dst_arr, [0,1,nodata_val])
-        dst_arr[bad] = 1
+        
+        # This is a good safety check
+        bad = ~np.isin(dst_arr, [0, 1, nodata_val])
+        if np.any(bad):
+            dst_arr[bad] = nodata_val
 
         out_fp = os.path.join(output_dir, f"{year}_W{week:02d}.tif")
         with rasterio.open(out_fp, 'w', **meta) as dst:
@@ -692,10 +756,10 @@ def process_s2_weekly_max_nn(
     return out_files
 
 
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
 
-#_______________________________________________________________________________________________________________________________________
-#_______________________________________________________________________________________________________________________________________
-#_______________________________________________________________________________________________________________________________________
 
 import os
 import numpy as np
@@ -708,103 +772,101 @@ def reproject_s3_weekly(
     input_dir: str,
     output_dir: str,
     dst_crs: str = 'EPSG:32632',
-    dst_res: tuple = (20, 20)
+    dst_res: tuple = (60, 60)
 ) -> list[str]:
     """
-    Aggregates daily Sentinel-3 binary snow masks into weekly composites via
-    temporal max (if any day sees snow, the week is snow) and then
-    reprojects/resamples each weekly mask to a common grid using
-    nearest-neighbor spatial resampling.
-
-    Input files must contain 'snowmask' in their name (case-insensitive),
-    excluding any '_datemap' partners. Outputs are written as
-    'YYYY_Www.tif' under `output_dir`.
-
-    Returns a list of filepaths for the unique weekly outputs.
+    Aggregates daily Sentinel-3 snow masks into weekly composites (binary),
+    masks out any non-{0,1} codes (treating them as nodata), then
+    reprojects each weekly raster to a common grid with explicit nodata=255.
     """
     os.makedirs(output_dir, exist_ok=True)
+
     # 1) Group daily files by ISO-week
-    week_groups = defaultdict(list)
+    week_groups: dict[str, list[str]] = defaultdict(list)
     for fname in sorted(os.listdir(input_dir)):
-        lower = fname.lower()
-        if 'snowmask' not in lower or '_datemap' in lower:
+        if not fname.lower().endswith('.tif'):
             continue
-        date_str = ''.join(c for c in fname if c.isdigit())[:8]
+        low = fname.lower()
+        if 'snowmask' not in low or '_datemap' in low:
+            continue
+        ds = ''.join(c for c in fname if c.isdigit())[:8]
         try:
-            d0 = datetime.strptime(date_str, '%Y%m%d').date()
+            d0 = datetime.strptime(ds, '%Y%m%d').date()
         except ValueError:
-            print(f"⚠️ Skipping (cannot parse date): {fname}")
+            print(f"⚠️ Skipping (bad date): {fname}")
             continue
-        iso = d0.isocalendar()
-        week_key = f"{iso.year}_W{iso.week:02d}"
-        week_groups[week_key].append(os.path.join(input_dir, fname))
+        y, w, _ = d0.isocalendar()
+        week_groups[f"{y}_W{w:02d}"].append(os.path.join(input_dir, fname))
 
     if not week_groups:
-        print("⚠️ No Sentinel-3 snowmask files found in input_dir.")
+        print("⚠️ No Sentinel-3 snowmask files found.")
         return []
 
-    # 2) Define target grid based on first group
-    first_week, first_paths = next(iter(week_groups.items()))
-    with rasterio.open(first_paths[0]) as src0:
-        src_crs    = src0.crs
-        src_bounds = src0.bounds
-        src_width  = src0.width
-        src_height = src0.height
+    # 2) Build common target grid from first file
+    first_fp = next(iter(week_groups.values()))[0]
+    with rasterio.open(first_fp) as src0:
+        src_crs        = src0.crs
+        src_bounds     = src0.bounds
+        width0, height0 = src0.width, src0.height
+        src_transform0 = src0.transform
 
     tgt_transform, tgt_width, tgt_height = calculate_default_transform(
         src_crs, dst_crs,
-        src_width, src_height,
+        width0, height0,
         *src_bounds,
         resolution=dst_res
     )
 
-    # 3) Prepare output metadata template
+    # 3) Output metadata template
     meta = {
-        'driver': 'GTiff',
-        'dtype': 'uint8',
-        'count': 1,
-        'crs': dst_crs,
+        'driver'   : 'GTiff',
+        'dtype'    : 'uint8',
+        'count'    : 1,
+        'crs'      : dst_crs,
         'transform': tgt_transform,
-        'width': tgt_width,
-        'height': tgt_height,
-        'nodata': 255,
-        'compress': 'deflate',
-        'tiled': True
+        'width'    : tgt_width,
+        'height'   : tgt_height,
+        'nodata'   : 255,
+        'compress' : 'deflate',
+        'tiled'    : True
     }
 
-    out_files = []
+    out_files: list[str] = []
 
-    # 4) Process each week: temporal max + spatial nearest resample
+    # 4) For each ISO-week, composite + reproject
     for week_key, paths in sorted(week_groups.items()):
-        # temporal composition: load all daily masks and take max
-        stacks = []
+        # a) load each daily mask, mask >1 as NaN but keep 0 and 1
+        stack = []
         for fp in paths:
             with rasterio.open(fp) as src:
-                arr = src.read(1).astype(np.uint8)
-                stacks.append(arr)
-        weekly_mask = np.max(np.stack(stacks, axis=0), axis=0).astype(np.uint8)
+                arr = src.read(1).astype('float32')
+                # only values > 1 → nodata
+                arr[arr > 1] = np.nan
+                stack.append(arr)
 
-        # initialize destination array with nodata
-        dst_arr = np.full((tgt_height, tgt_width), meta['nodata'], np.uint8)
+        # b) temporal max (NaN-aware)
+        weekly_float = np.nanmax(np.stack(stack, axis=0), axis=0)
 
-        # spatial resample: nearest-neighbor
+        # c) cast to uint8: 0=no-snow, 1=snow, 255=nodata
+        weekly_u = np.full(weekly_float.shape, 255, dtype='uint8')
+        weekly_u[weekly_float == 0] = 0
+        weekly_u[weekly_float == 1] = 1
+
+        # d) prefill dest with nodata, then warp
+        dst_arr = np.full((tgt_height, tgt_width), 255, dtype='uint8')
         reproject(
-            source=weekly_mask,
-            destination=dst_arr,
-            src_transform=src0.transform,
-            src_crs=src_crs,
-            dst_transform=tgt_transform,
-            dst_crs=dst_crs,
-            resampling=Resampling.nearest,
-            src_nodata=src0.nodata,
-            dst_nodata=meta['nodata']
+            source        = weekly_u,
+            destination   = dst_arr,
+            src_transform = src_transform0,
+            src_crs       = src_crs,
+            dst_transform = tgt_transform,
+            dst_crs       = dst_crs,
+            src_nodata    = 255,
+            dst_nodata    = 255,
+            resampling    = Resampling.nearest
         )
 
-        # clamp any anomalies
-        invalid = ~np.isin(dst_arr, [0, 1, meta['nodata']])
-        dst_arr[invalid] = 1
-
-        # write out
+        # e) write out
         out_fp = os.path.join(output_dir, f"{week_key}.tif")
         with rasterio.open(out_fp, 'w', **meta) as dst:
             dst.write(dst_arr, 1)
@@ -820,55 +882,70 @@ def reproject_s3_weekly(
 #_______________________________________________________________________________________________________________________________________
 
 
-
+import numpy as np
 import rasterio
 from rasterio.warp import reproject, Resampling
 from rasterio.enums import Resampling as ResamplingEnum
 
-def match_raster_grid(reference_path, target_path, output_path,
-                      resampling_method=ResamplingEnum.nearest):
+def match_raster_grid(reference_path: str,
+                      target_path: str,
+                      output_path: str,
+                      resampling_method=ResamplingEnum.nearest) -> None:
     """
-    Reprojects a raster (target) to match the exact grid of another (reference).
+    Reprojects a raster (target) to match the exact grid of another (reference),
+    preserving nodata by pre-filling the destination with nodata and
+    passing src_nodata/dst_nodata to reproject.
 
     Parameters:
-    - reference_path: str, path to raster whose shape/resolution/grid you want to match
-    - target_path: str, input raster to reproject
-    - output_path: str, path to save reprojected result
-    - resampling_method: rasterio Resampling method (e.g., nearest, bilinear)
+    - reference_path: raster to match (defines CRS, transform, shape, nodata)
+    - target_path: input raster to reproject
+    - output_path: where to save the reprojected raster
+    - resampling_method: nearest, bilinear, etc.
     """
-
+    # 1. Read reference metadata
     with rasterio.open(reference_path) as ref:
-        dst_crs = ref.crs
+        dst_crs       = ref.crs
         dst_transform = ref.transform
-        dst_shape = (ref.height, ref.width)
-        dst_profile = ref.profile.copy()
+        dst_height    = ref.height
+        dst_width     = ref.width
+        dst_profile   = ref.profile.copy()
+        dst_nodata    = ref.nodata if ref.nodata is not None else 255
 
+    # 2. Read source data and determine src_nodata
     with rasterio.open(target_path) as src:
-        src_data = src.read(1)  # assumes single band
-        dst_array = np.empty(dst_shape, dtype=src_data.dtype)
+        src_data   = src.read(1)
+        src_nodata = src.nodata if src.nodata is not None else dst_nodata
+        src_transform = src.transform
+        src_crs = src.crs
 
-        reproject(
-            source=src_data,
-            destination=dst_array,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            dst_transform=dst_transform,
-            dst_crs=dst_crs,
-            resampling=resampling_method
-        )
+    # 3. Pre-fill destination array with nodata
+    dst_array = np.full((dst_height, dst_width), dst_nodata, dtype=src_data.dtype)
 
-    # Save to file
+    # 4. Reproject with explicit nodata handling
+    reproject(
+        source        = src_data,
+        destination   = dst_array,
+        src_transform = src_transform,
+        src_crs       = src_crs,
+        src_nodata    = src_nodata,
+        dst_transform = dst_transform,
+        dst_crs       = dst_crs,
+        dst_nodata    = dst_nodata,
+        resampling    = resampling_method
+    )
+
+    # 5. Update profile and write
     dst_profile.update({
-        'height': dst_shape[0],
-        'width': dst_shape[1],
+        'height': dst_height,
+        'width': dst_width,
         'transform': dst_transform,
-        'crs': dst_crs
+        'crs': dst_crs,
+        'nodata': dst_nodata
     })
-
     with rasterio.open(output_path, 'w', **dst_profile) as dst:
         dst.write(dst_array, 1)
 
-    print(f"✅ Reprojected to match: {output_path}")
+    print(f"✅ Reprojected to match grid: {output_path}")
 
 
 
@@ -1184,7 +1261,7 @@ import rasterio
 
 def compute_weekly_statistics(clipped_root: str,
                               products: list[str],
-                              pixel_size: float = 20.0) -> pd.DataFrame:
+                              pixel_size: float = 60.0) -> pd.DataFrame:
     """
     Walks through clipped weekly TIFFs for each product, computes:
       • total_pixels   (arr != nodata)
@@ -1200,7 +1277,7 @@ def compute_weekly_statistics(clipped_root: str,
     products : list[str]
         List of product names matching subfolder names under clipped_root.
     pixel_size : float
-        Side length of a pixel in meters (default 20.0 → 400 m²).
+        Side length of a pixel in meters (default 60.0 → 400 m²).
 
     Returns
     -------
@@ -1251,80 +1328,376 @@ def compute_weekly_statistics(clipped_root: str,
 #_______________________________________________________________________________________________________________________________________
 
 
-
-from typing import List
 import os
 import itertools
-import glob
 import numpy as np
 import pandas as pd
 import rasterio
-from snow_processing import calculate_agreement
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.patches import Patch
+
 
 def compute_pairwise_agreement(
     aligned_root: str,
-    products: List[str],
-    common_weeks: List[str],
-    pixel_size: float = 20.0
+    products: list[str],
+    common_weeks: list[str],
+    pixel_size: float = 60.0,
+    downsample: int = 10      # factor for plotting to reduce memory
 ) -> pd.DataFrame:
     """
-    For each week in common_weeks and each pair of products, computes:
-      • agreement_pct, total_pixels, agree_pixels
-      • p1_only_pixels, p2_only_pixels
-      • p1_only_area_km2, p2_only_area_km2
-      • area_bias_km2 = (p2_only - p1_only) * pixel_area_km2
+    Compute per-week pairwise agreement stats and show difference maps between snow-mask products.
 
-    aligned_root : root folder containing subfolders named after each product,
-                   where each subfolder holds weekly .tif files named 'YYYY_Wxx.tif'
-    products     : list of product names (must match subfolder names)
-    common_weeks : list of week strings, e.g. ['2022_W07', '2022_W09', …]
-    pixel_size   : side length of a pixel (meters), default 20 → pixel_area 400 m²
+    For each product pair:
+      - Returns a DataFrame of agreement metrics.
+      - Plots a multi-panel figure of all weekly difference maps (downsampled) with agreement % in titles.
+    Finally, produces a single bar chart of *overall* agreement % for each product pair.
     """
     records = []
-    pixel_area_km2 = (pixel_size * pixel_size) / 1e6
+    pixel_area_km2 = (pixel_size ** 2) / 1e6
 
-    for week in common_weeks:
+    # Prepare storage
+    diff_store = {pair: [] for pair in itertools.combinations(products, 2)}
+    agree_store = {pair: [] for pair in itertools.combinations(products, 2)}
+
+    # Gather weekly stats and difference arrays
+    for week in sorted(common_weeks):
         for p1, p2 in itertools.combinations(products, 2):
-            f1 = os.path.join(aligned_root, p1, week + ".tif")
-            f2 = os.path.join(aligned_root, p2, week + ".tif")
-            if not (os.path.exists(f1) and os.path.exists(f2)):
+            f1 = os.path.join(aligned_root, p1, f"{week}.tif")
+            f2 = os.path.join(aligned_root, p2, f"{week}.tif")
+            if not (os.path.isfile(f1) and os.path.isfile(f2)):
                 continue
-
-            stats = calculate_agreement(f1, f2)
-            if stats is None:
-                # either a shape mismatch or zero‐pixel overlap
-                continue
-
-            # reopen the rasters to count exclusive snow pixels
             with rasterio.open(f1) as src1, rasterio.open(f2) as src2:
+                if (src1.width, src1.height) != (src2.width, src2.height):
+                    continue
                 a1 = src1.read(1)
                 a2 = src2.read(1)
+                nod1, nod2 = src1.nodata, src2.nodata
 
-            # boolean masks for snow
-            p1_snow = (a1 == 1)
-            p2_snow = (a2 == 1)
+            valid = np.ones_like(a1, bool)
+            if nod1 is not None:
+                valid &= (a1 != nod1)
+            if nod2 is not None:
+                valid &= (a2 != nod2)
+            total = int(valid.sum())
+            if total == 0:
+                continue
 
-            only1 = int(np.count_nonzero(p1_snow & ~p2_snow))
-            only2 = int(np.count_nonzero(p2_snow & ~p1_snow))
+            agree = int(((a1 == a2) & valid).sum())
+            pct   = 100.0 * agree / total
+            only1 = int(((a1 == 1) & (a2 == 0) & valid).sum())
+            only2 = int(((a2 == 1) & (a1 == 0) & valid).sum())
 
             records.append({
-                "week"             : week,
-                "prod1"            : p1,
-                "prod2"            : p2,
-                "agreement_pct"    : stats["agreement_pct"],
-                "total_pixels"     : stats["total_pixels"],
-                "agree_pixels"     : stats["agree_pixels"],
-                "p1_only_pixels"   : only1,
-                "p2_only_pixels"   : only2,
-                "p1_only_area_km2" : only1 * pixel_area_km2,
-                "p2_only_area_km2" : only2 * pixel_area_km2,
-                "area_bias_km2"    : (only2 - only1) * pixel_area_km2
+                'week': week,
+                'prod1': p1,
+                'prod2': p2,
+                'agreement_pct': pct,
+                'total_pixels': total,
+                'agree_pixels': agree,
+                'p1_only_pixels': only1,
+                'p2_only_pixels': only2,
+                'p1_only_area_km2': only1 * pixel_area_km2,
+                'p2_only_area_km2': only2 * pixel_area_km2,
+                'area_bias_km2': (only1 - only2) * pixel_area_km2,
             })
 
-    df = pd.DataFrame.from_records(records)
+            # create int8 diff to save memory
+            diff_arr = a1.astype(np.int8) - a2.astype(np.int8)
+            diff_masked = np.ma.masked_where(~valid, diff_arr)
+            if np.ma.count(diff_masked) > 0:
+                diff_store[(p1, p2)].append((week, diff_masked))
+                agree_store[(p1, p2)].append(pct)
 
-    if df.empty:
-        print("⚠️  No overlapping pairs found—check your paths, week list, or that files exist.")
-        return df
+    # If no data, return empty
+    if not records:
+        print("⚠️ No valid data found for any product pair.")
+        return pd.DataFrame()
 
-    return df.sort_values(["week", "prod1", "prod2"]).reset_index(drop=True)
+    df = pd.DataFrame(records)
+
+    # Plot difference maps per pair
+    for pair, diffs in diff_store.items():
+        p1, p2 = pair
+        if not diffs:
+            print(f"No overlapping data for {p1} vs {p2}.")
+            continue
+
+        stats = agree_store[pair]
+        n = len(diffs)
+        cols = min(4, n)
+        rows = (n + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+        cmap = ListedColormap(['blue', 'white', 'red'])
+        cmap.set_bad(color='lightgrey')
+        norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], cmap.N)
+
+        for ax, ((wk, diff), pct) in zip(axes.flat, zip(diffs, stats)):
+            disp = diff[::downsample, ::downsample]
+            ax.imshow(disp, cmap=cmap, norm=norm)
+            ax.set_title(f"{wk}\nAgree: {pct:.1f}%")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_edgecolor('black')
+
+        # Turn off any unused axes
+        for i in range(n, rows * cols):
+            axes.flat[i].axis('off')
+
+        fig.suptitle(f"Difference maps: {p1} vs {p2}", y=0.98)
+        fig.tight_layout(rect=[0, 0.1, 1, 0.96])
+        legend_patches = [
+            Patch(color='red',   label=f'{p1} only'),
+            Patch(color='white', label='agreement'),
+            Patch(color='blue',  label=f'{p2} only'),
+            Patch(color='lightgrey', label='no data')
+        ]
+        fig.legend(handles=legend_patches, loc='lower center', ncol=4, frameon=False)
+        plt.show()
+
+    # Plot overall agreement bar chart
+    pairs = list(agree_store.keys())
+    overall = [np.mean(agree_store[p]) for p in pairs]
+    labels = [f"{p1} vs {p2}" for p1, p2 in pairs]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(labels, overall, color='gray')
+    ax.set_ylim(0, 100)
+    ax.set_ylabel('Average Agreement (%)')
+    ax.set_title('Overall Pairwise Agreement')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.show()
+
+    return df.sort_values(['prod1', 'prod2', 'week']).reset_index(drop=True)
+
+
+
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+
+
+import os
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+
+
+def compute_multisensor_snow_agreement(
+    inputs: dict[str, str],  # product_name -> weekly_folder_path
+    output_dir: str,
+    common_weeks: list[str] | None = None
+) -> None:
+    """
+    Build multisensor snow consensus maps across multiple weeks,
+    then plot them all in a single mosaic figure with balanced side margins.
+
+    Each output GeoTIFF per week has values:
+      0 = all no-snow
+      1 = exactly one says snow
+      2 = exactly two say snow
+      3 = exactly three say snow
+      4 = all say snow
+      255 = nodata (no product had data)
+
+    Parameters
+    ----------
+    inputs : dict[str, str]
+        Mapping from product name to the folder containing its weekly TIFFs.
+    output_dir : str
+        Directory where consensus TIFFs and the combined plot will be saved.
+    common_weeks : list[str], optional
+        If provided, the exact list of week IDs (e.g. ['2022_W01', '2022_W02',...]);
+        otherwise, intersection of weeks present across all products is used.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1) Determine weeks to process
+    if common_weeks is None:
+        weeks_per_prod = []
+        for week_dir in inputs.values():
+            files = [os.path.splitext(f)[0]
+                     for f in os.listdir(week_dir)
+                     if f.lower().endswith('.tif')]
+            weeks_per_prod.append(set(files))
+        common = set.intersection(*weeks_per_prod) if weeks_per_prod else set()
+        common_weeks = sorted(common)
+
+    if not common_weeks:
+        print("⚠️  No common weeks found. Exiting.")
+        return
+
+    # Prepare to collect arrays for plotting
+    consensus_store = []  # list of (week_id, 2D array)
+    meta = None
+    nod = None
+
+    # 2) Loop through each week and build consensus
+    for week in common_weeks:
+        arrays = []
+        nodata_vals = []
+        for prod, week_dir in inputs.items():
+            fp = os.path.join(week_dir, f"{week}.tif")
+            if not os.path.isfile(fp):
+                break
+            with rasterio.open(fp) as src:
+                arr = src.read(1).astype('uint8')
+                nodata_val = src.nodata if src.nodata is not None else 255
+                arrays.append(arr)
+                nodata_vals.append(nodata_val)
+                if meta is None:
+                    meta = src.meta.copy()
+        else:
+            # only if all products had this week
+            stack = np.stack(arrays, axis=0)
+            nod = nodata_vals[0]
+            valid = (stack != nod)
+            snow = (stack == 1)
+            count = snow.sum(axis=0).astype('uint8')
+            all_nodata = ~valid.any(axis=0)
+            consensus = np.where(all_nodata, nod, count)
+
+            # write GeoTIFF
+            out_meta = meta.copy()
+            out_meta.update({
+                'dtype': 'uint8',
+                'count': 1,
+                'nodata': int(nod),
+                'compress': 'deflate',
+                'tiled': True
+            })
+            out_fp = os.path.join(output_dir, f"{week}.tif")
+            with rasterio.open(out_fp, 'w', **out_meta) as dst:
+                dst.write(consensus, 1)
+            print(f"✅ Wrote consensus map: {out_fp}")
+
+            consensus_store.append((week, consensus))
+
+    # 3) Plot all weeks in a single mosaic with balanced margins and frames
+    if not consensus_store:
+        print("⚠️ No consensus arrays to plot.")
+        return
+
+    n = len(consensus_store)
+    ncols = min(4, n)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(5 * ncols, 4 * nrows),
+        squeeze=False
+    )
+
+    # Discrete colormap: 0–4, with nodata masked as white
+    cmap = ListedColormap(['#440154', '#30678D', '#35B779', '#FDE725', '#FAF925'])
+    cmap.set_bad(color='white')
+    bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5]
+    norm = BoundaryNorm(bounds, cmap.N)
+
+    for ax, (week, arr) in zip(axes.flat, consensus_store):
+        masked = np.ma.masked_equal(arr, nod)
+        ax.imshow(masked, cmap=cmap, norm=norm)
+        ax.set_title(week)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        # Draw black frame around each subplot
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_edgecolor('black')
+            spine.set_linewidth(1)
+
+    # turn off any unused axes
+    for idx in range(len(consensus_store), nrows * ncols):
+        axes.flat[idx].axis('off')
+
+    # Legend patches
+    from matplotlib.patches import Patch
+    patches = [
+        Patch(color=cmap(i), label=str(i)) for i in range(5)
+    ] + [Patch(color='white', label='nodata')]
+    fig.legend(
+        handles=patches,
+        loc='lower center',
+        ncol=6,
+        frameon=False
+    )
+
+    fig.suptitle('Multisensor Snow Consensus', fontsize=16, y=0.98)
+    # Ensure equal left/right margins
+    fig.subplots_adjust(left=0.2, right=0.9, wspace=0.1, hspace=0.1)
+    plt.show()
+
+
+
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+#_______________________________________________________________________________________________________________________________________
+
+
+
+import os
+import re
+from datetime import date
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from snow_processing import calculate_agreement
+
+def plot_agreement_series(s2_dir: str, s3_dir: str):
+    """
+    Scan two folders of weekly two snow‐mask tiffs (named 'YYYY_Www.tif'),
+    compute S2-vs-S3 agreement for each common week, then plot agreement (%) 
+    as a time series. Weeks for which one of the products is missing remain gaps.
+    """
+    # regex to pull out year & ISO‐week
+    pattern = re.compile(r"(\d{4})_W(\d{2})\.tif$")
+    
+    records = []
+    for fn in os.listdir(s2_dir):
+        m = pattern.match(fn)
+        if not m:
+            continue
+        year, week = int(m.group(1)), int(m.group(2))
+        s2_fp = os.path.join(s2_dir, fn)
+        s3_fp = os.path.join(s3_dir, fn)
+        if not os.path.exists(s3_fp):
+            # skip weeks where S3 is missing
+            continue
+        
+        # compute pixel‐wise agreement
+        stats = calculate_agreement(s2_fp, s3_fp)
+        if stats is None:
+            continue
+        
+        # turn ISO‐week into a real date (Monday)
+        week_start = date.fromisocalendar(year, week, 1)
+        records.append((week_start, stats["agreement_pct"]))
+    
+    # assemble into a time‐indexed Series
+    df = pd.DataFrame(records, columns=["date", "agreement"]) \
+           .set_index("date") \
+           .sort_index()
+
+    # reindex to a full weekly Monday sequence, leaving NaNs where missing
+    full_idx = pd.date_range(start=df.index.min(),
+                             end=df.index.max(),
+                             freq="W-MON")
+    df = df.reindex(full_idx)
+
+    # plot
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(df.index, df["agreement"], marker="o", linestyle="-")
+    ax.set_title("S2 ↔ S3 Weekly Agreement Over Time")
+    ax.set_xlabel("Week starting")
+    ax.set_ylabel("Agreement (%)")
+
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    plt.xticks(rotation=45, ha="right")
+    plt.ylim(0, 100)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
