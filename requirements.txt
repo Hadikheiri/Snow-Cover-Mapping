@@ -1,0 +1,16 @@
+# Numerical & tabular data
+numpy>=1.21
+pandas>=1.3
+
+# Raster I/O, reprojection & masking
+rasterio>=1.2
+
+# Vector I/O & CRS ops (for loading/shaping ROI in notebooks)
+geopandas>=0.10
+
+# Plotting & visualization
+matplotlib>=3.4
+
+# Interactive environments
+notebook>=6.0
+jupyterlab>=3.0
