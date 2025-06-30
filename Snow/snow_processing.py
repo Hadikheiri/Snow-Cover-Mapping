@@ -1701,3 +1701,91 @@ def plot_agreement_series(s2_dir: str, s3_dir: str):
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.show()
+#_____________________________________________________________________________________
+#_____________________________________________________________________________________
+def logic_based_mask(product_mask):
+    """
+    Applies a simplified Let-It-Snow logic to a single product:
+    Returns 1 (snow) if pixel is snow, 0 (no snow) if not, np.nan if nodata.
+    """
+    mask = np.full_like(product_mask, np.nan, dtype=np.float32)
+    mask[product_mask == 1] = 1  # snow
+    mask[product_mask == 0] = 0  # no snow
+    # 255 or np.nan already excluded
+    return mask
+#_________________________________________________________________________________________
+#__________________________________________________________________________________________
+import os
+import numpy as np
+import pandas as pd
+import rasterio
+
+def run_regression_batch(modis_dir, aligned_base, products, common_weeks, sample_limit=500_000, scatter_output=None):
+    results = []
+    scatter_data = []
+
+    for week in common_weeks:
+        modis_fp = os.path.join(modis_dir, f"{week}.tif")
+        with rasterio.open(modis_fp) as src:
+            modis = src.read(1).astype(np.float32)
+            modis[modis == 255] = np.nan
+
+        for product in products:
+            product_fp = os.path.join(aligned_base, product, f"{week}.tif")
+            if not os.path.exists(product_fp):
+                print(f"⚠️ Skipping missing {product} {week}")
+                continue
+
+            with rasterio.open(product_fp) as src:
+                prod = src.read(1).astype(np.float32)
+                prod[prod == 255] = np.nan
+
+            # Find valid pixels
+            mask = ~np.isnan(modis) & ~np.isnan(prod)
+            modis_vals = modis[mask]
+            prod_vals  = prod[mask]
+
+            # Sampling
+            if sample_limit and len(modis_vals) > sample_limit:
+                idx = np.random.choice(len(modis_vals), size=sample_limit, replace=False)
+                modis_vals = modis_vals[idx]
+                prod_vals  = prod_vals[idx]
+
+            if len(modis_vals) < 2:
+                print(f"⚠️ Not enough data for regression in {week} ({product})")
+                continue
+
+            # Store values for scatter plot (only for 2023_W06)
+            if week == "2023_W06":
+                df_scatter = pd.DataFrame({
+                    "week": week,
+                    "product": product,
+                    "modis_value": modis_vals,
+                    "product_value": prod_vals
+                })
+                scatter_data.append(df_scatter)
+
+            # Regression
+            try:
+                slope = np.polyfit(prod_vals, modis_vals, 1)[0]
+                correlation = np.corrcoef(prod_vals, modis_vals)[0, 1]
+            except np.linalg.LinAlgError:
+                print(f"⚠️ Regression failed in {week} ({product}) due to SVD error")
+                continue
+
+            results.append({
+                "week": week,
+                "product": product,
+                "slope": slope,
+                "correlation": correlation,
+                "n_points": len(modis_vals)
+            })
+
+            print(f"✅ Regression — {product} vs MODIS for {week} | corr={correlation:.4f} | slope={slope:.4f}")
+
+    # Save scatter data if requested
+    if scatter_output and scatter_data:
+        pd.concat(scatter_data).to_csv(scatter_output, index=False)
+        print(f"📊 Scatter data for 2023_W06 saved to {scatter_output}")
+
+    return pd.DataFrame(results)
