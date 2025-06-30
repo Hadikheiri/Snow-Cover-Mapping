@@ -1,6 +1,7 @@
 # Snow Cover Mapping
 
-**Snow Cover Mapping** is a toolkit for processing, aggregating, and analyzing satellite-derived snow masks from multiple sensors (MODIS, GFSC, Sentinel-2, Sentinel-3). It provides functions for cleaning raw products, reprojection, resampling, weekly compositing, spatial clipping, agreement analysis, and visualization. The included Jupyter notebooks demonstrate end-to-end workflows and exploratory analyses.
+This project is a collaborative snow mapping initiative developed in alignment with the expectations and requirements of **CNR** and using data provided by **ARPA Lombardia**. The objective is to compare existing snow cover products (MODIS, GFSC, S2, S3), implement custom algorithms (machine learning and logic-based), and perform regression analysis to assess consistency and performance.
+
 
 ---
 
@@ -40,13 +41,18 @@ git clone https://github.com/Hadikheiri/Snow-Cover-Mapping.git
 cd Snow-Cover-Mapping
 ```
 
-2. Install dependencies (preferably in a virtual environment):
+**Requirements**:
+- Python ≥ 3.8
+- `numpy`, `pandas`, `rasterio`, `matplotlib`, `seaborn`, `scikit-learn`
+- Data folders with aligned snow masks and MODIS references
+
+2. Install dependencies:
 
 ```bash
-pip install -r requirements.txt
+pip install numpy pandas rasterio matplotlib seaborn scikit-learn
 ```
 
-> **Dependencies:** `rasterio`, `numpy`, `pandas`, `matplotlib`, `geopandas`
+
 
 ---
 
@@ -97,9 +103,17 @@ data_clean_fp = prepare_modis_mask("raw/20230101.tif", "clean/20230101.tif")
 
 ## Jupyter Notebooks
 
-- **main.ipynb**: Demonstrates a complete workflow for MODIS data—from cleaning through weekly composites and region clipping.
-- **EDA.ipynb**: Exploratory data analysis on processed weekly products: summary statistics, visualization of snow extent, and coverage comparisons.
-- **S2-S3.ipynb**: Compares Sentinel-2 and Sentinel-3 weekly snow products: coverage table, spatial agreement analysis, and time series plotting.
+**main.ipynb - classification and comparison**:  
+   Open `main.ipynb` to:
+   - Preprocess and align data (Sentinel, GFSC, MODIS)
+   - Apply Random Forest classifier on raw band combinations
+   - Generate logic-based masks (simplified Let-It-Snow)
+   - Evaluate performance (accuracy, precision, recall, F1)
+   - Plot confusion matrices and save metrics
+- **EDA.ipynb**:
+ Exploratory data analysis on processed weekly products: summary statistics, visualization of snow extent, and coverage comparisons.
+- **S2-S3.ipynb**:
+ Compares Sentinel-2 and Sentinel-3 weekly snow products: coverage table, spatial agreement analysis, and time series plotting.
 
 ---
 
@@ -114,12 +128,28 @@ Contributions are welcome! Please:
 5. Open a Pull Request
 
 ---
+## 📝 Notes
 
+- Data strictly follows the guidelines from **CNR** and was provided by **ARPA Lombardia**.
+- MODIS masks are used as the reference product for validation.
+- The Let-It-Snow logic was simplified for compatibility with binary masks.
+---
 ## License
 
 This project is released under the MIT License. See [LICENSE](LICENSE) for details.
 
 ---
+
+##  References
+
+- Let-It-Snow Algorithm: [https://gitlab.orfeo-toolbox.org/remote_modules/let-it-snow](https://gitlab.orfeo-toolbox.org/remote_modules/let-it-snow)
+- ARPA Lombardia Data Portal: [https://www.arpalombardia.it](https://www.arpalombardia.it)
+- CNR Collaboration Guidelines (internal documentation)
+
+
+-----
+
+
 
 ## Contact
 
