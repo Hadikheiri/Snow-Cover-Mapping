@@ -1,32 +1,73 @@
-# Snow Cover Mapping
+# Snow Cover Mapping in Lombardy, Italy
 
-This project is a collaborative snow mapping initiative developed in alignment with the expectations and requirements of **CNR** and using data provided by **ARPA Lombardia**. The objective is to compare existing snow cover products (MODIS, GFSC, S2, S3), implement custom algorithms (machine learning and logic-based), and perform regression analysis to assess consistency and performance.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)  
+![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)
 
+A modular pipeline to harmonize, compare, and classify multi‐sensor snow‐cover products (MODIS, Copernicus GFSC, Sentinel-2, Sentinel-3) over the Lombardy Alps. This project was developed under the supervision of the National Research Council of Italy (CNR) using data provided by ARPA Lombardia.  
 
 ---
 
-## Final Pairwise Agreement Plot
+## Table of Contents
 
-Below is the result of the pairwise comparison of snow masks over time, illustrating the pixel-wise agreement percentage between sensor products across ISO weeks:
+- [Overview](#overview)  
+- [Features](#features)  
+- [Repository Structure](#repository-structure)  
+- [Installation](#installation)  
+- [Data Layout](#data-layout)  
+- [Quick Start / Usage](#quick-start--usage)  
+  - [Preprocessing & Aggregation](#preprocessing--aggregation)  
+  - [Agreement & Bias Analysis](#agreement--bias-analysis)  
+  - [Classification & Regression](#classification--regression)  
+- [Jupyter Notebooks](#jupyter-notebooks)  
+- [Results Gallery](#results-gallery)  
+- [Contributing](#contributing)  
+- [License & Citation](#license--citation)  
+- [Acknowledgements](#acknowledgements)  
+- [Contact](#contact)  
 
-![image](https://github.com/user-attachments/assets/01454d18-20c2-4bf6-87f6-86bb147f933e)
+---
 
+## Overview
+
+Snow cover governs hydrology, ecology, and climate feedbacks in mountain regions. This repository implements a fully-automated workflow to:
+
+1. **Preprocess** and **harmonize** four snow products—MODIS (500 m), GFSC (60 m), Sentinel-2 (20 m), Sentinel-3 (300 m)—to a unified 60 m grid and ISO-week temporal cadence.  
+2. **Compare** them via pixel-wise agreement, consensus maps, and area-bias time series.  
+3. **Classify** snow presence using both a Random Forest model and a simplified Let-It-Snow logic.  
+4. **Quantify** continuous agreement with MODIS through linear regression (slope & correlation).  
+
+All code is written in Python, leverages open-source geospatial libraries, and is designed for reproducibility and extension.
+
+---
+
+## Features
+
+- **Multi-sensor preprocessing**: reprojection, resampling, quality filtering, weekly stacking  
+- **Agreement analysis**: pairwise % agreement, multi-sensor consensus, spatial discrepancy maps  
+- **Area-bias evaluation**: time-series of km² differences between products  
+- **Snow classification**: Random Forest fusion vs. logic-based voting  
+- **Regression module**: correlation & slope against MODIS reference  
+- **Notebook demos**: exploratory analysis, focused S2 vs. S3 comparison, end-to-end pipeline  
 
 ---
 
 ## Repository Structure
 
-```
+```text
 Snow-Cover-Mapping/
-├── Snow/                  # Core processing code and notebooks
-│   ├── snow_processing.py # Core processing functions
-│   ├── main.ipynb         # Main pipeline demo (MODIS)
-│   ├── EDA.ipynb          # Exploratory Data Analysis
-│   └── S2-S3.ipynb        # Sentinel-2 vs Sentinel-3 comparison workflow
-├── requirements.txt       # Python package dependencies
-├── .gitignore             # Git ignore patterns
-├── LICENSE                # Project license (MIT)
-└── README.md              # Project overview and instructions
+├── Snow/                            # Core code & notebooks
+│   ├── snow_processing.py           # Data‐processing functions
+│   ├── main.ipynb                   # End-to-end pipeline walkthrough
+│   ├── EDA.ipynb                    # Exploratory Data Analysis & plots
+│   └── S2-S3.ipynb                  # Sentinel-2 vs. Sentinel-3 comparison
+├── data/                            # (Local only; not tracked)
+│   ├── raw/                         # Original sensor TIFFs
+│   ├── processed/                   # Intermediate files (weekly, clipped)
+│   └── roi/                         # Region‐of‐interest shapefile
+├── figures/                         # Generated plots & maps
+├── requirements.txt                 # Python dependencies
+├── LICENSE                          # MIT license
+└── README.md                        # Project documentation
 ```
 
 
@@ -34,128 +75,166 @@ Snow-Cover-Mapping/
 
 ## Installation
 
-1. Clone the repository:
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/Hadikheiri/Snow-Cover-Mapping.git
+   cd Snow-Cover-Mapping
+   ```
 
-```bash
-git clone https://github.com/Hadikheiri/Snow-Cover-Mapping.git
-cd Snow-Cover-Mapping
-```
+2. **Create and activate a Python 3.13+ virtual environment:**
+   ```bash
+   python3.13 -m venv .env
+   # macOS / Linux
+   source .env/bin/activate
+   # Windows
+   .env\Scripts\activate
+   ```
 
-**Requirements**:
-- Python ≥ 3.8
-- `numpy`, `pandas`, `rasterio`, `matplotlib`, `seaborn`, `scikit-learn`
-- Data folders with aligned snow masks and MODIS references
-
-2. Install dependencies:
-
-```bash
-pip install numpy pandas rasterio matplotlib seaborn scikit-learn
-```
-
-
+3. **Install required packages:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
 ---
 
-## Usage
+## Data Layout
 
-Most functionality is exposed via `snow_processing.py`. Import and call as needed:
+Place your raw data under `data/raw/` following this structure:
+
+```bash
+data/raw/
+├── MODIS/
+│   └── YYYYMMDD_MODIS.tif
+├── GFSC/
+│   ├── YYYYMMDD_GF.tif
+│   └── YYYYMMDD_QC.tif
+├── S2/
+│   ├── YYYYMMDD_S2.tif
+│   └── YYYYMMDD_datemap.tif
+└── S3/
+    └── YYYYMMDD_S3.tif
+```
+
+After preprocessing, outputs are saved as:
+
+- `data/processed/weekly/<PRODUCT>/<ISO_WEEK>.tif`
+- `data/processed/clipped/<PRODUCT>/<ISO_WEEK>.tif`
+
+---
+
+## Quick Start / Usage
+
+Below are Python snippets illustrating core workflows. Adapt them into scripts or Jupyter cells.
+
+### Preprocessing & Aggregation
 
 ```python
-from snow_processing import (
+from Snow.snow_processing import (
     prepare_modis_mask,
     reproject_resample_visualize,
-    aggregate_weekly,
     resample_reproject_gfsc,
     process_s2_weekly,
     reproject_s3_weekly,
-    match_raster_grid,
-    clip_weekly_to_roi,
-    calculate_agreement,
-    compute_weekly_statistics,
-    compute_pairwise_agreement,
-    compute_multisensor_snow_agreement,
-    plot_agreement_series
+    aggregate_weekly,
+    aggregate_weekly_gfsc
 )
 
-# Example: Clean a raw MODIS mask
-data_clean_fp = prepare_modis_mask("raw/20230101.tif", "clean/20230101.tif")
+# 1. Clean & binarize a raw MODIS mask
+prepare_modis_mask(
+    src_path="data/raw/MODIS/20220101_MODIS.tif",
+    dst_path="data/processed/modis_clean/2022_W02.tif"
+)
+
+# 2. Stack daily files into weekly composites
+aggregate_weekly(
+    input_folder="data/processed/modis_clean",
+    output_folder="data/processed/weekly/MODIS",
+    method="max"
+)
 ```
 
-### Key Functions
+### Agreement & Bias Analysis
 
-- **extract\_weeks\_from\_filenames**: Extract ISO-week keys from filenames or folder names.
-- **check\_all\_products\_side\_by\_side**: Compare weekly coverage across multiple products.
-- **prepare\_modis\_mask**: Remap raw MODIS snow mask to binary/no-data values.
-- **reproject\_resample\_visualize**: Reproject & resample rasters, with optional preview.
-- **aggregate\_weekly / aggregate\_weekly\_gfsc**: Build ISO-week composites for raw or GFSC data.
-- **process\_s2\_weekly**: Split bi-weekly Sentinel-2 masks into weekly composites.
-- **reproject\_s3\_weekly**: Aggregate and reproject Sentinel-3 daily masks into weekly composites.
-- **match\_raster\_grid**: Align one raster to the grid of a reference.
-- **visual\_compare\_rasters / visual\_compare\_rasters\_strict**: Side-by-side, overlay, or difference visualization.
-- **clip\_weekly\_to\_roi**: Clip weekly TIFFs to a region of interest.
-- **calculate\_agreement**: Compute pixel-wise agreement between two masks.
-- **compute\_weekly\_statistics**: Summary stats (snow area, coverage) for clipped weekly products.
-- **compute\_pairwise\_agreement**: Pairwise agreement metrics and difference maps across products.
-- **compute\_multisensor\_snow\_agreement**: Consensus maps across multiple products.
-- **plot\_agreement\_series**: Time series of agreement between two products.
+```python
+from Snow.snow_processing import compute_pairwise_agreement
+
+df = compute_pairwise_agreement(
+    aligned_root="data/processed/clipped",
+    products=["MODIS", "GFSC", "S2", "S3"],
+    common_weeks=[...list of ISO weeks...]
+)
+```
+
+### Classification & Regression
+
+```python
+from Snow.snow_processing import run_regression_batch, logic_based_mask
+# See `main.ipynb` for orchestrated Random Forest & logic-based workflows.
+```
 
 ---
 
 ## Jupyter Notebooks
 
-**main.ipynb - classification and comparison**:  
-   Open `main.ipynb` to:
-   - Preprocess and align data (Sentinel, GFSC, MODIS)
-   - Apply Random Forest classifier on raw band combinations
-   - Generate logic-based masks (simplified Let-It-Snow)
-   - Evaluate performance (accuracy, precision, recall, F1)
-   - Plot confusion matrices and save metrics
-- **EDA.ipynb**:
- Exploratory data analysis on processed weekly products: summary statistics, visualization of snow extent, and coverage comparisons.
-- **S2-S3.ipynb**:
- Compares Sentinel-2 and Sentinel-3 weekly snow products: coverage table, spatial agreement analysis, and time series plotting.
+- **`Snow/main.ipynb`** — Full pipeline: preprocess, classify, evaluate, and visualize.
+- **`Snow/EDA.ipynb`**  — Exploratory plots: consensus maps, agreement & bias time series.
+- **`Snow/S2-S3.ipynb`** — Dedicated Sentinel-2 vs Sentinel-3 comparison.
+
+> Each notebook’s first cell outlines the paths you need to adjust for your local setup.
+
+---
+
+## Results Gallery
+
+**Agreement (%) between each sensor pair over 23 ISO weeks.**
+
+
+
+**Difference in snow-covered area (km²) between sensor pairs.**
+
+More maps and plots are available in the `figures/` directory.
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please:
+We welcome improvements and bug fixes:
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/YourFeature`)
-3. Commit your changes (`git commit -m "Add awesome feature"`)
-4. Push to your fork (`git push origin feature/YourFeature`)
+1. Fork the repo
+2. Create a branch: `git checkout -b feature/YourFeature`
+3. Commit your changes: `git commit -m "Add feature"`
+4. Push to your fork: `git push origin feature/YourFeature`
 5. Open a Pull Request
 
----
-## 📝 Notes
-
-- Data strictly follows the guidelines from **CNR** and was provided by **ARPA Lombardia**.
-- MODIS masks are used as the reference product for validation.
-- The Let-It-Snow logic was simplified for compatibility with binary masks.
----
-## License
-
-This project is released under the MIT License. See [LICENSE](LICENSE) for details.
+Please follow PEP8 styling and include tests for new functionality.
 
 ---
 
-##  References
+## License & Citation
 
-- Let-It-Snow Algorithm: [https://gitlab.orfeo-toolbox.org/remote_modules/let-it-snow](https://gitlab.orfeo-toolbox.org/remote_modules/let-it-snow)
-- ARPA Lombardia Data Portal: [https://www.arpalombardia.it](https://www.arpalombardia.it)
-- CNR Collaboration Guidelines (internal documentation)
+This project is distributed under the [MIT License](LICENSE).
 
+If you use this work, please cite:
 
------
+> H. Kheiri Gharajeh & O. Y. Yousif (2025). *Implementation of a Multi-Sensor Algorithm for Time Series Snow Cover Mapping in Lombardy, Italy.* Geoinformatics Project, Politecnico di Milano.
 
+---
 
+## Acknowledgements
+
+- **Advisors:** Prof. Giovanna Venuti & Prof. Daniela Stroppiana
+- **Data Provider:** ARPA Lombardia
+- **Technical Guidelines:** National Research Council of Italy (CNR)
+
+---
 
 ## Contact
 
-For questions or support, please open an issue or contact the maintainer:
+For questions or support, please open an issue or contact:
 
-- **First Contributer:** Hadi Kheiri Gharajeh, [hadi.kheiri@mail.polimi.it](mailto\:hadi.kheiri@mail.polimi.it)
-- **Second Contributer:** Ola Elwasila Abdelrahman Yousif, [olaelwasila@mail.polimi.it](mailto\:olaelwasila@mail.polimi.it)
+- **Hadi Kheiri Gharajeh** — [hadi.kheiri@mail.polimi.it](mailto\:hadi.kheiri@mail.polimi.it)
+- **Ola Elwasila A. Yousif** — [olaelwasila@mail.polimi.it](mailto\:olaelwasila@mail.polimi.it)
+
+
 
 
